@@ -19,6 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import sys
 import json
 import math
 
@@ -39,9 +40,14 @@ except ImportError:  # pragma: no cover
     PPO = None  # type: ignore
 
 try:
+    # ⚠️ FreeCAD 路径注入：请按你本机 FreeCAD 实际安装版本修改（如 0.20/0.21/1.1）。
+    sys.path.append("D:\\software\\FreeCAD 1.1\\bin")
     import otsun  # type: ignore
-except ImportError:  # pragma: no cover
+except ImportError as exc:  # pragma: no cover
     otsun = None  # type: ignore
+    OTSUN_IMPORT_ERROR = exc
+else:
+    OTSUN_IMPORT_ERROR = None
 
 
 # =========================
@@ -269,7 +275,9 @@ class LFROTSunEnv(gym.Env):
     def _init_otsun_scene(self) -> None:
         """一次性初始化 OTSun 静态场景与可变对象引用。"""
         if otsun is None:
-            raise ImportError("未安装 otsun，请先执行：pip install otsun")
+            raise ImportError(
+                f"导入 otsun 失败。请先确认 FreeCAD 路径注入是否正确，再检查 otsun 安装。原始错误：{OTSUN_IMPORT_ERROR}"
+            ) from OTSUN_IMPORT_ERROR
 
         # 构建 Scene
         scene_ctor = getattr(otsun, "Scene", None)
