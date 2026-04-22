@@ -38,6 +38,11 @@ try:
 except ImportError:  # pragma: no cover
     PPO = None  # type: ignore
 
+try:
+    import otsun  # type: ignore
+except ImportError:  # pragma: no cover
+    otsun = None  # type: ignore
+
 
 # =========================
 # 全局物理与几何硬性参数
@@ -175,17 +180,7 @@ class WeatherParser:
 
 
 class LFROTSunEnv(gym.Env):
-    """LFR + OTSun Dummy 代理的强化学习环境。
-
-    该环境将“动态瞄准策略”抽象为连续控制问题：
-    - 状态（State）：[alpha_s, gamma_s, DNI] 的归一化连续向量；
-    - 动作（Action）：18 面一次镜的横向瞄准偏移（m）；
-    - 奖励（Reward）：效率提升 - 能流不均匀惩罚 - 溢出惩罚。
-
-    注意：
-    - run_otsun_tracing() 目前为简化代理模型，便于快速训练验证。
-    - 后续可将此函数替换为真实 OTSun 光线追迹调用。
-    """
+    """LFR + OTSun 真实光线追迹强化学习环境。"""
 
     metadata = {"render_modes": []}
 
@@ -214,6 +209,18 @@ class LFROTSunEnv(gym.Env):
         self._steps: int = 0
         self._rng = np.random.default_rng(seed=42)
 
+        # -------- OTSun 缓存（性能关键）--------
+        self._ots_scene: Any = None
+        self._ots_light: Any = None
+        self._ots_mirrors: List[Any] = []
+        self._ots_absorber: Any = None
+        self._ots_cpc: Any = None
+        self._mirror_centers: np.ndarray = np.zeros((NUM_MIRRORS, 3), dtype=np.float64)
+        self._receiver_point = np.array([0.0, 0.0, RECEIVER_HEIGHT_M], dtype=np.float64)
+        self._ray_count = 5000
+
+        self._init_otsun_scene()
+
     @staticmethod
     def _normalize_state(alpha_s: float, gamma_s: float, dni: float) -> np.ndarray:
         """将物理状态量归一化到神经网络友好的尺度。"""
@@ -226,11 +233,219 @@ class LFROTSunEnv(gym.Env):
         alpha_s, gamma_s, dni = self.weather.get_solar_vector(self._current_idx)
         return self._normalize_state(alpha_s, gamma_s, dni)
 
-    def reset(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None) -> Tuple[np.ndarray, Dict[str, Any]]:
-        """重置环境。
+    @staticmethod
+    def _safe_norm(vec: np.ndarray, eps: float = 1e-9) -> np.ndarray:
+        n = float(np.linalg.norm(vec))
+        if n <= eps:
+            return np.zeros_like(vec)
+        return vec / n
 
-        随机选取一个白天有效时刻作为 episode 起点。
-        """
+    def _denormalize_state(self, state: np.ndarray) -> Tuple[float, float, float]:
+        alpha_s = float(np.clip(state[0], 0.0, 1.0) * 90.0)
+        gamma_s = float(np.clip(state[1], -1.0, 1.0) * 180.0)
+        dni = float(np.clip(state[2], 0.0, 1.0) * 1200.0)
+        return alpha_s, gamma_s, dni
+
+    @staticmethod
+    def _call_by_names(obj: Any, names: List[str], *args: Any, **kwargs: Any) -> Any:
+        for name in names:
+            fn = getattr(obj, name, None)
+            if callable(fn):
+                return fn(*args, **kwargs)
+        raise AttributeError(f"{obj!r} 缺少可调用接口: {names}")
+
+    def _set_vector_like(self, obj: Any, candidate_names: List[str], vec: np.ndarray) -> None:
+        v = np.asarray(vec, dtype=float)
+        for name in candidate_names:
+            if hasattr(obj, name):
+                attr = getattr(obj, name)
+                if callable(attr):
+                    attr(v.tolist())
+                else:
+                    setattr(obj, name, v.tolist())
+                return
+        raise AttributeError(f"无法在 {obj!r} 上设置向量属性: {candidate_names}")
+
+    def _init_otsun_scene(self) -> None:
+        """一次性初始化 OTSun 静态场景与可变对象引用。"""
+        if otsun is None:
+            raise ImportError("未安装 otsun，请先执行：pip install otsun")
+
+        # 构建 Scene
+        scene_ctor = getattr(otsun, "Scene", None)
+        if scene_ctor is None:
+            raise AttributeError("otsun 模块未找到 Scene 构造器")
+        self._ots_scene = scene_ctor()
+
+        # 中央吸收管 + 玻璃套管 + CPC（静态几何）
+        geom = getattr(otsun, "geometry", otsun)
+        mat = getattr(otsun, "materials", otsun)
+
+        # 兼容不同版本 API：优先 create_*，次选构造器
+        add_obj = lambda o: self._call_by_names(self._ots_scene, ["add", "add_object", "append"], o)
+
+        absorber_material = self._call_by_names(mat, ["Absorber", "BlackAbsorber", "PerfectAbsorber"])
+        glass_material = self._call_by_names(mat, ["Glass", "Transparent"], refractive_index=1.52)
+        mirror_material = self._call_by_names(mat, ["Mirror", "SpecularMirror"], reflectivity=MIRROR_REFLECTIVITY)
+
+        self._ots_absorber = self._call_by_names(
+            geom,
+            ["Cylinder", "create_cylinder"],
+            center=[0.0, 0.0, RECEIVER_HEIGHT_M],
+            axis=[0.0, 1.0, 0.0],
+            radius=ABSORBER_OUTER_RADIUS_M,
+            length=MIRROR_LENGTH_M,
+            material=absorber_material,
+            name="absorber_tube",
+        )
+        add_obj(self._ots_absorber)
+
+        glass_envelope = self._call_by_names(
+            geom,
+            ["Cylinder", "create_cylinder"],
+            center=[0.0, 0.0, RECEIVER_HEIGHT_M],
+            axis=[0.0, 1.0, 0.0],
+            radius=GLASS_ENVELOPE_OUTER_RADIUS_M,
+            length=MIRROR_LENGTH_M,
+            material=glass_material,
+            name="glass_envelope",
+        )
+        add_obj(glass_envelope)
+
+        self._ots_cpc = self._call_by_names(
+            geom,
+            ["CPC", "create_cpc"],
+            center=[0.0, 0.0, RECEIVER_HEIGHT_M],
+            axis=[0.0, 1.0, 0.0],
+            aperture_half_width=CPC_APERTURE_HALF_WIDTH_M,
+            accept_half_angle_deg=CPC_ACCEPT_HALF_ANGLE_DEG,
+            length=MIRROR_LENGTH_M,
+            name="cpc",
+        )
+        add_obj(self._ots_cpc)
+
+        # 一次镜阵列（静态位置 + 动态姿态）
+        mirror_pitch = 0.65
+        x0 = -0.5 * (NUM_MIRRORS - 1) * mirror_pitch
+        for i in range(NUM_MIRRORS):
+            x = x0 + i * mirror_pitch
+            center = np.array([x, 0.0, 0.0], dtype=np.float64)
+            self._mirror_centers[i] = center
+
+            mirror = self._call_by_names(
+                geom,
+                ["RectMirror", "Plane", "create_rect_mirror"],
+                center=center.tolist(),
+                width=0.5,
+                length=MIRROR_LENGTH_M,
+                normal=[0.0, 0.0, 1.0],
+                material=mirror_material,
+                name=f"mirror_{i:02d}",
+            )
+            add_obj(mirror)
+            self._ots_mirrors.append(mirror)
+
+        self._ots_light = self._call_by_names(otsun, ["LightSource", "Sun", "SolarSource"], direction=[0.0, 0.0, -1.0], dni=900.0)
+        self._call_by_names(self._ots_scene, ["set_light", "set_source", "add_light"], self._ots_light)
+
+    def _sun_direction(self, alpha_s_deg: float, gamma_s_deg: float) -> np.ndarray:
+        """将高度角/方位角转成从太阳指向地面的单位向量。"""
+        alpha = math.radians(alpha_s_deg)
+        gamma = math.radians(gamma_s_deg)
+        # 以正南为 x+，向西为 y+ 的近似局部坐标
+        sx = math.cos(alpha) * math.cos(gamma)
+        sy = math.cos(alpha) * math.sin(gamma)
+        sz = math.sin(alpha)
+        sun_from_ground = np.array([sx, sy, sz], dtype=np.float64)
+        # OTSun 光线方向使用“传播方向”，因此取反（太阳 -> 地面）
+        return self._safe_norm(-sun_from_ground)
+
+    def _update_mirror_kinematics(self, sun_dir: np.ndarray, action: np.ndarray) -> None:
+        """根据 action 映射 18 面镜法向，满足“太阳入射 -> CPC 目标点反射”几何。"""
+        action = np.asarray(action, dtype=np.float64).reshape(NUM_MIRRORS)
+        action = np.clip(action, ACTION_LOW_M, ACTION_HIGH_M)
+
+        for i, mirror in enumerate(self._ots_mirrors):
+            center = self._mirror_centers[i]
+
+            # 每面镜的瞄准点：在 CPC 开口中心基础上沿 x 方向偏移。
+            target = self._receiver_point.copy()
+            target[0] += action[i]
+
+            # 入射方向（指向镜面）与出射方向（镜面 -> 目标）
+            in_dir = self._safe_norm(-sun_dir)
+            out_dir = self._safe_norm(target - center)
+
+            # 反射定律：法向为入射与出射单位向量的角平分向量
+            bisector = in_dir + out_dir
+            if np.linalg.norm(bisector) < 1e-9:
+                # 极端退化：入射与出射几乎完全相反，回退到朝向目标的“抬升法向”
+                bisector = out_dir + np.array([0.0, 0.0, 1.0], dtype=np.float64)
+            normal = self._safe_norm(bisector)
+
+            # 尽量保证镜面朝上，避免法向翻转造成追迹异常
+            if normal[2] < 0:
+                normal = -normal
+
+            self._set_vector_like(mirror, ["normal", "set_normal", "set_orientation_normal"], normal)
+
+    def _update_sun_source(self, sun_dir: np.ndarray, dni: float) -> None:
+        """更新 OTSun 光源方向与 DNI。"""
+        self._set_vector_like(self._ots_light, ["direction", "set_direction"], sun_dir)
+
+        dni_safe = max(0.0, float(dni))
+        for name in ["dni", "irradiance", "power_density"]:
+            if hasattr(self._ots_light, name):
+                setattr(self._ots_light, name, dni_safe)
+                break
+
+    def _extract_tracing_metrics(self, tracing_result: Any, dni: float) -> Tuple[float, float, float]:
+        """从 OTSun 结果中提取效率、能流标准差和溢出比例。"""
+        total_in = max(dni * MIRROR_LENGTH_M * NUM_MIRRORS, 1e-9)
+
+        # 兼容不同命名：absorbed_power / tube_absorbed_power / absorbed_energy
+        absorbed = 0.0
+        for name in ["absorbed_power", "tube_absorbed_power", "absorbed_energy"]:
+            if hasattr(tracing_result, name):
+                absorbed = float(getattr(tracing_result, name))
+                break
+            if isinstance(tracing_result, dict) and name in tracing_result:
+                absorbed = float(tracing_result[name])
+                break
+
+        miss = 0.0
+        for name in ["missed_aperture_power", "spill_power", "miss_energy"]:
+            if hasattr(tracing_result, name):
+                miss = float(getattr(tracing_result, name))
+                break
+            if isinstance(tracing_result, dict) and name in tracing_result:
+                miss = float(tracing_result[name])
+                break
+
+        flux_arr: np.ndarray
+        raw_flux = None
+        for name in ["absorber_flux", "flux_map", "tube_flux_distribution"]:
+            if hasattr(tracing_result, name):
+                raw_flux = getattr(tracing_result, name)
+                break
+            if isinstance(tracing_result, dict) and name in tracing_result:
+                raw_flux = tracing_result[name]
+                break
+
+        if raw_flux is None:
+            flux_arr = np.zeros((32,), dtype=np.float64)
+        else:
+            flux_arr = np.asarray(raw_flux, dtype=np.float64).reshape(-1)
+
+        flux_mean = max(float(np.mean(flux_arr)), 1e-9)
+        flux_std = float(np.std(flux_arr) / flux_mean)
+
+        optical_efficiency = float(np.clip(absorbed / total_in, 0.0, 1.0))
+        spill_penalty = float(np.clip(miss / total_in, 0.0, 1.0))
+        return optical_efficiency, flux_std, spill_penalty
+
+    def reset(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None) -> Tuple[np.ndarray, Dict[str, Any]]:
+        """重置环境。"""
         super().reset(seed=seed)
         if seed is not None:
             self._rng = np.random.default_rng(seed)
@@ -240,43 +455,25 @@ class LFROTSunEnv(gym.Env):
         return self._get_obs(), {"data_index": self._current_idx}
 
     def run_otsun_tracing(self, state: np.ndarray, action: np.ndarray) -> Tuple[float, float, float]:
-        """Dummy OTSun 代理：用简化物理估算闭环指标。
+        """真实 OTSun 光线追迹：更新镜面与太阳，再执行追迹并提取指标。"""
+        alpha_s, gamma_s, dni = self._denormalize_state(np.asarray(state, dtype=np.float32).reshape(3))
+        action = np.asarray(action, dtype=np.float32).reshape(NUM_MIRRORS)
 
-        输入：
-            state: 归一化状态 [alpha_n, gamma_n, dni_n]
-            action: 18 镜面偏移量（m）
+        sun_dir = self._sun_direction(alpha_s, gamma_s)
 
-        返回：
-            optical_efficiency: 光学效率（0~1）
-            flux_std: 集热管能流标准差（归一化量纲）
-            spill_penalty: 溢出惩罚项（>=0）
+        # 1) 更新一次镜几何姿态（仅改法向，不重建场景）
+        self._update_mirror_kinematics(sun_dir, action)
 
-        简化思想：
-        - 光学效率受太阳高度角（高太阳角更优）和瞄准偏移离散程度影响；
-        - 偏移越接近 0，溢出通常越少；偏移绝对值越大，溢出风险增加；
-        - 能流标准差近似由镜面偏移分布与太阳方位扰动共同决定。
-        """
-        alpha_n, gamma_n, dni_n = float(state[0]), float(state[1]), float(state[2])
+        # 2) 更新太阳方向与强度
+        self._update_sun_source(sun_dir, dni)
 
-        action = np.asarray(action, dtype=np.float32)
-        action = np.clip(action, ACTION_LOW_M, ACTION_HIGH_M)
+        # 3) 执行追迹
+        tracer = self._call_by_names(otsun, ["RayTracer", "Tracer", "Simulation"])
+        sim = tracer(scene=self._ots_scene, light=self._ots_light, num_rays=self._ray_count)
+        result = self._call_by_names(sim, ["run", "trace", "simulate"])
 
-        action_std = float(np.std(action))
-        action_mean_abs = float(np.mean(np.abs(action)))
-
-        sun_factor = 0.55 + 0.45 * alpha_n
-        dni_factor = dni_n
-
-        intercept_factor = float(np.exp(-8.0 * action_std))
-        spill_penalty = max(0.0, (action_mean_abs / CPC_APERTURE_HALF_WIDTH_M) ** 1.8 - 0.2)
-
-        optical_efficiency = MIRROR_REFLECTIVITY * sun_factor * dni_factor * intercept_factor
-        optical_efficiency = float(np.clip(optical_efficiency, 0.0, 1.0))
-
-        # gamma 扰动 + 偏移离散导致不均匀
-        flux_std = float(0.08 + 1.4 * action_std + 0.12 * abs(gamma_n))
-
-        return optical_efficiency, flux_std, float(spill_penalty)
+        # 4) 提取三项奖励指标
+        return self._extract_tracing_metrics(result, dni)
 
     def step(self, action: np.ndarray):
         """环境一步推进：执行动作并计算奖励。"""
