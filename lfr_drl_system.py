@@ -34,9 +34,9 @@ except ImportError as exc:  # pragma: no cover
     ) from exc
 
 try:
-    from stable_baselines3 import PPO
-except ImportError:  # pragma: no cover
-    PPO = None  # type: ignore
+    from stable_baselines3 import PPO as _PPO  # 延迟兼容兜底：仅作为可用性探测
+except Exception:  # pragma: no cover
+    _PPO = None  # type: ignore
 
 
 # =========================
@@ -313,13 +313,51 @@ class PPOTrainer:
         self.model_path = Path(model_path)
         self.weather = WeatherParser(self.csv_path)
         self.env = LFROTSunEnv(self.weather)
+        self._ppo_error_hint: Optional[str] = None
+
+    def _load_ppo_backend(self):
+        """延迟加载 PPO，避免在 NumPy/PyTorch 不兼容机器上导入即崩溃。"""
+        if _PPO is not None:
+            return _PPO
+        try:
+            from stable_baselines3 import PPO as imported_ppo
+
+            return imported_ppo
+        except Exception as exc:  # noqa: BLE001
+            self._ppo_error_hint = str(exc)
+            return None
+
+    def _heuristic_strategy(self, index: Optional[int] = None) -> np.ndarray:
+        """无 DRL 依赖的启发式策略（兼容低配置/依赖冲突环境）。"""
+        if index is None:
+            index = self._find_summer_solstice_noon_index()
+        if index is None:
+            return np.zeros((NUM_MIRRORS,), dtype=np.float32)
+
+        alpha_s, gamma_s, dni = self.weather.get_solar_vector(index)
+        state = self.env._normalize_state(alpha_s, gamma_s, dni)
+        alpha_n, gamma_n, dni_n = float(state[0]), float(state[1]), float(state[2])
+
+        amp = (1.0 - alpha_n) * 0.06 + (1.0 - dni_n) * 0.02
+        center_shift = -0.02 * gamma_n
+        pattern = np.linspace(-1.0, 1.0, NUM_MIRRORS, dtype=np.float32)
+        action = center_shift + amp * pattern
+        return np.clip(action, ACTION_LOW_M, ACTION_HIGH_M).astype(np.float32)
 
     def train(self, total_timesteps: int = 100_000, seed: int = 42) -> None:
         """执行 PPO 训练并保存模型。"""
-        if PPO is None:
-            raise ImportError("stable_baselines3 未安装，请先执行：pip install stable-baselines3")
+        ppo_cls = self._load_ppo_backend()
+        if ppo_cls is None:
+            hint = self._ppo_error_hint or "未知错误"
+            raise ImportError(
+                "PPO 后端不可用（常见原因：NumPy 2.x 与当前 PyTorch/扩展二进制不兼容）。\n"
+                f"原始错误：{hint}\n"
+                "建议：\n"
+                "1) 降级 NumPy：pip install \"numpy<2\"\n"
+                "2) 或升级 torch/stable-baselines3 到支持 NumPy 2 的版本。"
+            )
 
-        model = PPO(
+        model = ppo_cls(
             policy="MlpPolicy",
             env=self.env,
             verbose=1,
@@ -354,13 +392,27 @@ class PPOTrainer:
         return best_idx
 
     def predict_extreme_strategy(self) -> np.ndarray:
-        """预测夏至正午（或高太阳高度角）时刻的最佳 18 镜偏移策略。"""
-        if PPO is None:
-            raise ImportError("stable_baselines3 未安装，请先执行：pip install stable-baselines3")
-        if not self.model_path.exists():
-            raise FileNotFoundError(f"模型文件不存在：{self.model_path}，请先训练。")
+        """预测夏至正午（或高太阳高度角）时刻的最佳 18 镜偏移策略。
 
-        model = PPO.load(str(self.model_path), env=self.env)
+        兼容策略：
+        - 若本机可用 PPO 且模型存在：走 DRL 推理；
+        - 否则自动回退到启发式策略，避免因 NumPy/PyTorch 版本冲突中断流程。
+        """
+        ppo_cls = self._load_ppo_backend()
+        if ppo_cls is None:
+            print(
+                "[兼容模式] stable_baselines3/PyTorch 不可用，已自动切换启发式策略。"
+                "如需 DRL 训练，请执行：pip install \"numpy<2\" 或升级 torch。"
+            )
+            return self._heuristic_strategy()
+        if not self.model_path.exists():
+            print(
+                f"[兼容模式] 未找到模型 {self.model_path}，已自动切换启发式策略。"
+                "如需 DRL 推理，请先调用 train() 训练并保存模型。"
+            )
+            return self._heuristic_strategy()
+
+        model = ppo_cls.load(str(self.model_path), env=self.env)
         idx = self._find_summer_solstice_noon_index()
         if idx is None:
             raise RuntimeError("未找到可用于推理的有效时刻。")
@@ -448,9 +500,15 @@ def run_end_to_end(
     model_path: str | Path = "ppo_lfr_otsun.zip",
     export_path: str | Path = "tonatiuh_targeting_report.json",
 ) -> np.ndarray:
-    """一键执行端到端流程：训练 -> 推理 -> 导出。"""
+    """一键执行端到端流程：训练 -> 推理 -> 导出。
+
+    在 NumPy/PyTorch 不兼容时自动降级为“无训练推理 + 启发式导出”，确保流程可运行。
+    """
     trainer = PPOTrainer(csv_path=csv_path, model_path=model_path)
-    trainer.train(total_timesteps=total_timesteps)
+    try:
+        trainer.train(total_timesteps=total_timesteps)
+    except ImportError as exc:
+        print(f"[兼容模式] 跳过 PPO 训练：{exc}")
 
     best_action = trainer.predict_extreme_strategy()
     print("\n夏至正午（或高太阳高度角）预测最佳 18 镜瞄准偏移：")
