@@ -8,46 +8,41 @@ LFR 动态瞄准策略优化：单文件实现
 4) tonatiuh_exporter.py
 
 说明：
-- OTSun 接口在本文件中以 Dummy 代理函数实现（run_otsun_tracing），用于打通 DRL 闭环。
+- OTSun 接口在本文件中采用真实光线追迹（run_otsun_tracing）实现 DRL 物理闭环。
 - 代码使用面向对象设计，并提供中文 Docstring 与类型注解。
 """
 
 from __future__ import annotations
+
+import sys
+import os
+import multiprocessing
+multiprocessing.set_start_method('spawn', force=True)
+
+FREECAD_BIN = r"D:\software\FreeCAD 1.1\bin"
+sys.path.append(FREECAD_BIN)
+
+import FreeCAD
+print("FreeCAD 导入成功！版本:", FreeCAD.Version())
+
+import otsun
+import numpy as np
+from multiprocessing import Pool
 
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import sys
 import json
 import math
 
-import numpy as np
 import pandas as pd
 
-try:
-    import gymnasium as gym
-    from gymnasium import spaces
-except ImportError as exc:  # pragma: no cover
-    raise ImportError(
-        "未安装 gymnasium，请先执行：pip install gymnasium"
-    ) from exc
+import gymnasium as gym
+from gymnasium import spaces
 
-try:
-    from stable_baselines3 import PPO
-except ImportError:  # pragma: no cover
-    PPO = None  # type: ignore
-
-try:
-    # ⚠️ FreeCAD 路径注入：请按你本机 FreeCAD 实际安装版本修改（如 0.20/0.21/1.1）。
-    sys.path.append("D:\\software\\FreeCAD 1.1\\bin")
-    import otsun  # type: ignore
-except ImportError as exc:  # pragma: no cover
-    otsun = None  # type: ignore
-    OTSUN_IMPORT_ERROR = exc
-else:
-    OTSUN_IMPORT_ERROR = None
+from stable_baselines3 import PPO
 
 
 # =========================
@@ -221,6 +216,13 @@ class LFROTSunEnv(gym.Env):
         self._ots_mirrors: List[Any] = []
         self._ots_absorber: Any = None
         self._ots_cpc: Any = None
+        self._doc: Any = None
+        self._sel: List[Any] = []
+        self._tracking: Any = None
+        self._emitting_region: Any = None
+        self._spectrum_cdf: Any = None
+        self._direction_distribution: Any = None
+        self._main_direction: np.ndarray = np.array([0.0, 0.0, -1.0], dtype=np.float64)
         self._mirror_centers: np.ndarray = np.zeros((NUM_MIRRORS, 3), dtype=np.float64)
         self._receiver_point = np.array([0.0, 0.0, RECEIVER_HEIGHT_M], dtype=np.float64)
         self._ray_count = 5000
@@ -273,88 +275,56 @@ class LFROTSunEnv(gym.Env):
         raise AttributeError(f"无法在 {obj!r} 上设置向量属性: {candidate_names}")
 
     def _init_otsun_scene(self) -> None:
-        """一次性初始化 OTSun 静态场景与可变对象引用。"""
-        if otsun is None:
-            raise ImportError(
-                f"导入 otsun 失败。请先确认 FreeCAD 路径注入是否正确，再检查 otsun 安装。原始错误：{OTSUN_IMPORT_ERROR}"
-            ) from OTSUN_IMPORT_ERROR
+        """一次性初始化 OTSun 场景（静态几何只构建一次）。"""
+        otsun.ReflectorSpecularLayer("Mir1", 0.95)
+        otsun.ReflectorSpecularLayer("Mir2", 0.91)
+        otsun.AbsorberSimpleLayer("Abs", 0.95)
+        otsun.TransparentSimpleLayer("Trans", 0.965)
 
-        # 构建 Scene
-        scene_ctor = getattr(otsun, "Scene", None)
-        if scene_ctor is None:
-            raise AttributeError("otsun 模块未找到 Scene 构造器")
-        self._ots_scene = scene_ctor()
+        freecad_file = os.path.abspath("LFR.FCStd")
+        if not os.path.exists(freecad_file):
+            raise FileNotFoundError(f"未找到 FreeCAD 场景文件: {freecad_file}")
 
-        # 中央吸收管 + 玻璃套管 + CPC（静态几何）
-        geom = getattr(otsun, "geometry", otsun)
-        mat = getattr(otsun, "materials", otsun)
+        FreeCAD.openDocument(freecad_file)
+        self._doc = FreeCAD.ActiveDocument
+        self._sel = list(self._doc.Objects)
+        self._ots_scene = otsun.Scene(self._sel)
 
-        # 兼容不同版本 API：优先 create_*，次选构造器
-        add_obj = lambda o: self._call_by_names(self._ots_scene, ["add", "add_object", "append"], o)
+        # 固定几何体对象缓存（吸热管、玻璃罩、CPC）
+        for obj in self._sel:
+            name = f"{getattr(obj, 'Name', '')} {getattr(obj, 'Label', '')}".lower()
+            if ("abs" in name or "absorber" in name) and self._ots_absorber is None:
+                self._ots_absorber = obj
+            if ("cpc" in name or "compound" in name) and self._ots_cpc is None:
+                self._ots_cpc = obj
 
-        absorber_material = self._call_by_names(mat, ["Absorber", "BlackAbsorber", "PerfectAbsorber"])
-        glass_material = self._call_by_names(mat, ["Glass", "Transparent"], refractive_index=1.52)
-        mirror_material = self._call_by_names(mat, ["Mirror", "SpecularMirror"], reflectivity=MIRROR_REFLECTIVITY)
+        # 镜面对象缓存（严格取 18 面）
+        mirror_candidates: List[Any] = []
+        for obj in self._sel:
+            name = f"{getattr(obj, 'Name', '')} {getattr(obj, 'Label', '')}".lower()
+            if "mir" in name or "mirror" in name:
+                mirror_candidates.append(obj)
+        if len(mirror_candidates) < NUM_MIRRORS:
+            raise RuntimeError(f"FreeCAD 场景中镜面数量不足，期望 {NUM_MIRRORS}，实际 {len(mirror_candidates)}")
+        self._ots_mirrors = mirror_candidates[:NUM_MIRRORS]
 
-        self._ots_absorber = self._call_by_names(
-            geom,
-            ["Cylinder", "create_cylinder"],
-            center=[0.0, 0.0, RECEIVER_HEIGHT_M],
-            axis=[0.0, 1.0, 0.0],
-            radius=ABSORBER_OUTER_RADIUS_M,
-            length=MIRROR_LENGTH_M,
-            material=absorber_material,
-            name="absorber_tube",
+        for i, mirror in enumerate(self._ots_mirrors):
+            base = mirror.Placement.Base
+            self._mirror_centers[i] = np.array([base.x, base.y, base.z], dtype=np.float64)
+
+        self._spectrum_cdf = otsun.cdf_from_pdf_file(os.path.join("data", "ASTMG173-direct.txt"))
+        self._direction_distribution = otsun.buie_distribution(0.05)
+        self._main_direction = np.array([0.0, 0.0, -1.0], dtype=np.float64)
+        self._tracking = otsun.MultiTracking(self._main_direction, self._ots_scene)
+        self._tracking.make_movements()
+        self._emitting_region = otsun.SunWindow(self._ots_scene, self._main_direction)
+        self._ots_light = otsun.LightSource(
+            self._ots_scene,
+            self._emitting_region,
+            self._spectrum_cdf,
+            1.0,
+            self._direction_distribution,
         )
-        add_obj(self._ots_absorber)
-
-        glass_envelope = self._call_by_names(
-            geom,
-            ["Cylinder", "create_cylinder"],
-            center=[0.0, 0.0, RECEIVER_HEIGHT_M],
-            axis=[0.0, 1.0, 0.0],
-            radius=GLASS_ENVELOPE_OUTER_RADIUS_M,
-            length=MIRROR_LENGTH_M,
-            material=glass_material,
-            name="glass_envelope",
-        )
-        add_obj(glass_envelope)
-
-        self._ots_cpc = self._call_by_names(
-            geom,
-            ["CPC", "create_cpc"],
-            center=[0.0, 0.0, RECEIVER_HEIGHT_M],
-            axis=[0.0, 1.0, 0.0],
-            aperture_half_width=CPC_APERTURE_HALF_WIDTH_M,
-            accept_half_angle_deg=CPC_ACCEPT_HALF_ANGLE_DEG,
-            length=MIRROR_LENGTH_M,
-            name="cpc",
-        )
-        add_obj(self._ots_cpc)
-
-        # 一次镜阵列（静态位置 + 动态姿态）
-        mirror_pitch = 0.65
-        x0 = -0.5 * (NUM_MIRRORS - 1) * mirror_pitch
-        for i in range(NUM_MIRRORS):
-            x = x0 + i * mirror_pitch
-            center = np.array([x, 0.0, 0.0], dtype=np.float64)
-            self._mirror_centers[i] = center
-
-            mirror = self._call_by_names(
-                geom,
-                ["RectMirror", "Plane", "create_rect_mirror"],
-                center=center.tolist(),
-                width=0.5,
-                length=MIRROR_LENGTH_M,
-                normal=[0.0, 0.0, 1.0],
-                material=mirror_material,
-                name=f"mirror_{i:02d}",
-            )
-            add_obj(mirror)
-            self._ots_mirrors.append(mirror)
-
-        self._ots_light = self._call_by_names(otsun, ["LightSource", "Sun", "SolarSource"], direction=[0.0, 0.0, -1.0], dni=900.0)
-        self._call_by_names(self._ots_scene, ["set_light", "set_source", "add_light"], self._ots_light)
 
     def _sun_direction(self, alpha_s_deg: float, gamma_s_deg: float) -> np.ndarray:
         """将高度角/方位角转成从太阳指向地面的单位向量。"""
@@ -395,61 +365,55 @@ class LFROTSunEnv(gym.Env):
             if normal[2] < 0:
                 normal = -normal
 
-            self._set_vector_like(mirror, ["normal", "set_normal", "set_orientation_normal"], normal)
+            # 中文注释：优先走 OTSun/对象自带 set_normal；若无，则回退为 FreeCAD Placement 旋转。
+            if hasattr(mirror, "set_normal") and callable(mirror.set_normal):
+                mirror.set_normal(normal.tolist())
+            elif hasattr(mirror, "normal"):
+                mirror.normal = normal.tolist()
+            else:
+                src = FreeCAD.Vector(0.0, 0.0, 1.0)
+                dst = FreeCAD.Vector(float(normal[0]), float(normal[1]), float(normal[2]))
+                rot = FreeCAD.Rotation(src, dst)
+                mirror.Placement = FreeCAD.Placement(mirror.Placement.Base, rot)
+
+        if hasattr(self._doc, "recompute"):
+            self._doc.recompute()
 
     def _update_sun_source(self, sun_dir: np.ndarray, dni: float) -> None:
         """更新 OTSun 光源方向与 DNI。"""
-        self._set_vector_like(self._ots_light, ["direction", "set_direction"], sun_dir)
-
-        dni_safe = max(0.0, float(dni))
-        for name in ["dni", "irradiance", "power_density"]:
-            if hasattr(self._ots_light, name):
-                setattr(self._ots_light, name, dni_safe)
-                break
+        # 中文注释：每一步仅更新太阳方向，不重新实例化静态场景；追迹对象按需重建以减少几何构建开销。
+        self._main_direction = np.asarray(sun_dir, dtype=np.float64)
+        if self._tracking is not None:
+            self._tracking.undo_movements()
+        self._tracking = otsun.MultiTracking(self._main_direction, self._ots_scene)
+        self._tracking.make_movements()
+        self._emitting_region = otsun.SunWindow(self._ots_scene, self._main_direction)
+        self._ots_light = otsun.LightSource(
+            self._ots_scene,
+            self._emitting_region,
+            self._spectrum_cdf,
+            max(1.0, float(dni) / 900.0),
+            self._direction_distribution,
+        )
 
     def _extract_tracing_metrics(self, tracing_result: Any, dni: float) -> Tuple[float, float, float]:
-        """从 OTSun 结果中提取效率、能流标准差和溢出比例。"""
-        total_in = max(dni * MIRROR_LENGTH_M * NUM_MIRRORS, 1e-9)
+        """从 Experiment 提取效率、能流标准差和溢出比例。"""
+        exp = tracing_result
+        aperture_collector_Th = 11 * 0.5 * 32 * 1_000_000
+        source_term = max(exp.number_of_rays / exp.light_source.emitting_region.aperture, 1e-9)
+        optical_efficiency = float(np.clip((exp.captured_energy_Th / aperture_collector_Th) / source_term, 0.0, 1.0))
 
-        # 兼容不同命名：absorbed_power / tube_absorbed_power / absorbed_energy
-        absorbed = 0.0
-        for name in ["absorbed_power", "tube_absorbed_power", "absorbed_energy"]:
-            if hasattr(tracing_result, name):
-                absorbed = float(getattr(tracing_result, name))
-                break
-            if isinstance(tracing_result, dict) and name in tracing_result:
-                absorbed = float(tracing_result[name])
-                break
-
-        miss = 0.0
-        for name in ["missed_aperture_power", "spill_power", "miss_energy"]:
-            if hasattr(tracing_result, name):
-                miss = float(getattr(tracing_result, name))
-                break
-            if isinstance(tracing_result, dict) and name in tracing_result:
-                miss = float(tracing_result[name])
-                break
-
-        flux_arr: np.ndarray
-        raw_flux = None
-        for name in ["absorber_flux", "flux_map", "tube_flux_distribution"]:
-            if hasattr(tracing_result, name):
-                raw_flux = getattr(tracing_result, name)
-                break
-            if isinstance(tracing_result, dict) and name in tracing_result:
-                raw_flux = tracing_result[name]
-                break
-
-        if raw_flux is None:
-            flux_arr = np.zeros((32,), dtype=np.float64)
+        # 兼容不同版本：若没有细粒度通量则退化为单值分布
+        if hasattr(exp, "flux_in_elements"):
+            flux_arr = np.asarray(exp.flux_in_elements, dtype=np.float64).reshape(-1)
         else:
-            flux_arr = np.asarray(raw_flux, dtype=np.float64).reshape(-1)
-
+            flux_arr = np.array([float(getattr(exp, "captured_energy_Th", 0.0))], dtype=np.float64)
         flux_mean = max(float(np.mean(flux_arr)), 1e-9)
         flux_std = float(np.std(flux_arr) / flux_mean)
 
-        optical_efficiency = float(np.clip(absorbed / total_in, 0.0, 1.0))
-        spill_penalty = float(np.clip(miss / total_in, 0.0, 1.0))
+        spilled = float(getattr(exp, "escaped_energy", 0.0))
+        total = max(float(getattr(exp, "total_energy", spilled + getattr(exp, "captured_energy_Th", 0.0))), 1e-9)
+        spill_penalty = float(np.clip(spilled / total, 0.0, 1.0))
         return optical_efficiency, flux_std, spill_penalty
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None) -> Tuple[np.ndarray, Dict[str, Any]]:
@@ -475,13 +439,12 @@ class LFROTSunEnv(gym.Env):
         # 2) 更新太阳方向与强度
         self._update_sun_source(sun_dir, dni)
 
-        # 3) 执行追迹
-        tracer = self._call_by_names(otsun, ["RayTracer", "Tracer", "Simulation"])
-        sim = tracer(scene=self._ots_scene, light=self._ots_light, num_rays=self._ray_count)
-        result = self._call_by_names(sim, ["run", "trace", "simulate"])
+        # 3) 执行追迹（2000~5000 条光线区间内取 5000）
+        exp = otsun.Experiment(self._ots_scene, self._ots_light, int(self._ray_count), None)
+        exp.run()
 
         # 4) 提取三项奖励指标
-        return self._extract_tracing_metrics(result, dni)
+        return self._extract_tracing_metrics(exp, dni)
 
     def step(self, action: np.ndarray):
         """环境一步推进：执行动作并计算奖励。"""
