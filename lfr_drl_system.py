@@ -310,44 +310,50 @@ class LFROTSunEnv(gym.Env):
             FreeCAD.Vector(0.0, 1.0, 0.0),
         )
 
-       # ---- CPC（简化为沿槽长方向的实体导光槽）----
+        # ---- CPC（简化为沿槽长方向的实体导光槽）----
         cpc = self._doc.addObject("Part::Feature", "CPC")
         cpc.Label = "CPC"
         cpc_height = 0.45
-        
-        # 1. 最安全的方法：只传 3 个参数（长、宽、高）生成长方体
+
+        # makeBox 仅使用 3 参数（长、宽、高）；位置通过 Placement.Base 单独设置
         cpc.Shape = Part.makeBox(
             CPC_APERTURE_FULL_WIDTH_M,
             MIRROR_LENGTH_M,
-            cpc_height
+            cpc_height,
         )
-        
-        # 2. 然后单独移动它的位置 (这里把大模型写的第4个参数提取出来)
+
         cpc.Placement.Base = FreeCAD.Vector(
-            -CPC_APERTURE_HALF_WIDTH_M, 
-            -MIRROR_LENGTH_M / 2.0, 
-            RECEIVER_HEIGHT_M - cpc_height / 2.0
+            -CPC_APERTURE_HALF_WIDTH_M,
+            -MIRROR_LENGTH_M / 2.0,
+            RECEIVER_HEIGHT_M - cpc_height / 2.0,
         )
 
         # ---- Primary Mirrors（18 面镜子）----
-        mirror_width = 0.5
+        MIRROR_WIDTH_M = 0.5
         mirror_thickness = 0.005
-        mirror_span = mirror_width * NUM_MIRRORS
-        x_start = -mirror_span / 2.0 + mirror_width / 2.0
+        mirror_span = MIRROR_WIDTH_M * NUM_MIRRORS
+        x_start = -mirror_span / 2.0 + MIRROR_WIDTH_M / 2.0
+        self._mirror_centers_y = np.zeros(NUM_MIRRORS, dtype=np.float64)
 
         mirrors: List[Any] = []
         for i in range(NUM_MIRRORS):
             mirror = self._doc.addObject("Part::Feature", f"Mirror_{i+1:02d}")
             mirror.Label = f"PrimaryMirror_{i+1:02d}"
-            x_center = x_start + i * mirror_width
+            x_center = x_start + i * MIRROR_WIDTH_M
+
+            # makeBox 仅使用 3 参数（长、宽、高）
             mirror.Shape = Part.makeBox(
-                mirror_width,
+                MIRROR_WIDTH_M,
                 MIRROR_LENGTH_M,
                 mirror_thickness,
-                FreeCAD.Vector(x_center - mirror_width / 2.0, -MIRROR_LENGTH_M / 2.0, 0.0),
-                FreeCAD.Vector(1.0, 0.0, 0.0),
-                FreeCAD.Vector(0.0, 0.0, 1.0),
             )
+            base_vec = FreeCAD.Vector(
+                x_center - MIRROR_WIDTH_M / 2.0,
+                -MIRROR_LENGTH_M / 2.0,
+                -mirror_thickness / 2.0,
+            )
+            mirror.Placement.Base = base_vec
+            self._mirror_centers_y[i] = base_vec.y + MIRROR_LENGTH_M / 2.0
             mirrors.append(mirror)
 
         self._doc.recompute()
@@ -493,8 +499,41 @@ class LFROTSunEnv(gym.Env):
 
         sun_dir = self._sun_direction(alpha_s, gamma_s)
 
-        # 1) 更新一次镜几何姿态（仅改法向，不重建场景）
-        self._update_mirror_kinematics(sun_dir, action)
+        # 1) 显式更新 18 面镜位姿（绕镜子几何中心旋转）
+        MIRROR_WIDTH_M = 0.5
+        mirror_thickness = 0.005
+        mirror_centers_y = getattr(self, "_mirror_centers_y", np.zeros(NUM_MIRRORS, dtype=np.float64))
+        center_offset = FreeCAD.Vector(MIRROR_WIDTH_M / 2.0, MIRROR_LENGTH_M / 2.0, mirror_thickness / 2.0)
+
+        for i, mirror in enumerate(self._ots_mirrors):
+            center = self._mirror_centers[i]
+            target = self._receiver_point.copy()
+            target[0] += float(np.clip(action[i], ACTION_LOW_M, ACTION_HIGH_M))
+
+            in_dir = self._safe_norm(-sun_dir)
+            out_dir = self._safe_norm(target - center)
+            bisector = in_dir + out_dir
+            if np.linalg.norm(bisector) < 1e-9:
+                bisector = out_dir + np.array([0.0, 0.0, 1.0], dtype=np.float64)
+            normal_vector = self._safe_norm(bisector)
+            if normal_vector[2] < 0:
+                normal_vector = -normal_vector
+
+            # 1) numpy -> FreeCAD.Vector
+            normal_fc = FreeCAD.Vector(float(normal_vector[0]), float(normal_vector[1]), float(normal_vector[2]))
+            # 2) 从默认法向 (0,0,1) 旋转到目标法向
+            rot = FreeCAD.Rotation(FreeCAD.Vector(0, 0, 1), normal_fc)
+            # 4) 与初始化一致的镜子基座
+            base_vec = FreeCAD.Vector(
+                -MIRROR_WIDTH_M / 2.0,
+                float(mirror_centers_y[i]) - MIRROR_LENGTH_M / 2.0,
+                -mirror_thickness / 2.0,
+            )
+            # 5) 使用带旋转中心的 Placement 完整更新位姿
+            mirror.Placement = FreeCAD.Placement(base_vec, rot, center_offset)
+
+        if hasattr(self._doc, "recompute"):
+            self._doc.recompute()
 
         # 2) 更新太阳方向与强度
         self._update_sun_source(sun_dir, dni)
