@@ -23,6 +23,7 @@ FREECAD_BIN = r"D:\software\FreeCAD 1.1\bin"
 sys.path.append(FREECAD_BIN)
 
 import FreeCAD
+import Part
 print("FreeCAD 导入成功！版本:", FreeCAD.Version())
 
 import otsun
@@ -275,42 +276,93 @@ class LFROTSunEnv(gym.Env):
         raise AttributeError(f"无法在 {obj!r} 上设置向量属性: {candidate_names}")
 
     def _init_otsun_scene(self) -> None:
-        """一次性初始化 OTSun 场景（静态几何只构建一次）。"""
+        """一次性初始化 OTSun 场景（纯代码建模，静态几何只构建一次）。"""
+        if self._ots_scene is not None:
+            return
+
         otsun.ReflectorSpecularLayer("Mir1", 0.95)
         otsun.ReflectorSpecularLayer("Mir2", 0.91)
         otsun.AbsorberSimpleLayer("Abs", 0.95)
         otsun.TransparentSimpleLayer("Trans", 0.965)
 
-        freecad_file = os.path.abspath("LFR.FCStd")
-        if not os.path.exists(freecad_file):
-            raise FileNotFoundError(f"未找到 FreeCAD 场景文件: {freecad_file}")
+        doc_name = "LFR_DRL_PureCode"
+        if FreeCAD.getDocument(doc_name) is not None:
+            FreeCAD.closeDocument(doc_name)
+        self._doc = FreeCAD.newDocument(doc_name)
 
-        FreeCAD.openDocument(freecad_file)
-        self._doc = FreeCAD.ActiveDocument
-        self._sel = list(self._doc.Objects)
-        self._ots_scene = otsun.Scene(self._sel)
+        # ---- Absorber（吸收管）----
+        absorber = self._doc.addObject("Part::Feature", "Absorber")
+        absorber.Label = "Absorber"
+        absorber.Shape = Part.makeCylinder(
+            ABSORBER_OUTER_RADIUS_M,
+            MIRROR_LENGTH_M,
+            FreeCAD.Vector(0.0, -MIRROR_LENGTH_M / 2.0, RECEIVER_HEIGHT_M),
+            FreeCAD.Vector(0.0, 1.0, 0.0),
+        )
 
-        # 固定几何体对象缓存（吸热管、玻璃罩、CPC）
-        for obj in self._sel:
-            name = f"{getattr(obj, 'Name', '')} {getattr(obj, 'Label', '')}".lower()
-            if ("abs" in name or "absorber" in name) and self._ots_absorber is None:
-                self._ots_absorber = obj
-            if ("cpc" in name or "compound" in name) and self._ots_cpc is None:
-                self._ots_cpc = obj
+        # ---- Glass Envelope（玻璃罩）----
+        glass = self._doc.addObject("Part::Feature", "GlassEnvelope")
+        glass.Label = "GlassEnvelope"
+        glass.Shape = Part.makeCylinder(
+            GLASS_ENVELOPE_OUTER_RADIUS_M,
+            MIRROR_LENGTH_M,
+            FreeCAD.Vector(0.0, -MIRROR_LENGTH_M / 2.0, RECEIVER_HEIGHT_M),
+            FreeCAD.Vector(0.0, 1.0, 0.0),
+        )
 
-        # 镜面对象缓存（严格取 18 面）
-        mirror_candidates: List[Any] = []
-        for obj in self._sel:
-            name = f"{getattr(obj, 'Name', '')} {getattr(obj, 'Label', '')}".lower()
-            if "mir" in name or "mirror" in name:
-                mirror_candidates.append(obj)
-        if len(mirror_candidates) < NUM_MIRRORS:
-            raise RuntimeError(f"FreeCAD 场景中镜面数量不足，期望 {NUM_MIRRORS}，实际 {len(mirror_candidates)}")
-        self._ots_mirrors = mirror_candidates[:NUM_MIRRORS]
+        # ---- CPC（简化为沿槽长方向的实体导光槽）----
+        cpc = self._doc.addObject("Part::Feature", "CPC")
+        cpc.Label = "CPC"
+        cpc_height = 0.45
+        cpc.Shape = Part.makeBox(
+            CPC_APERTURE_FULL_WIDTH_M,
+            MIRROR_LENGTH_M,
+            cpc_height,
+            FreeCAD.Vector(-CPC_APERTURE_HALF_WIDTH_M, -MIRROR_LENGTH_M / 2.0, RECEIVER_HEIGHT_M - cpc_height / 2.0),
+            FreeCAD.Vector(1.0, 0.0, 0.0),
+            FreeCAD.Vector(0.0, 0.0, 1.0),
+        )
+
+        # ---- Primary Mirrors（18 面镜子）----
+        mirror_width = 0.5
+        mirror_thickness = 0.005
+        mirror_span = mirror_width * NUM_MIRRORS
+        x_start = -mirror_span / 2.0 + mirror_width / 2.0
+
+        mirrors: List[Any] = []
+        for i in range(NUM_MIRRORS):
+            mirror = self._doc.addObject("Part::Feature", f"Mirror_{i+1:02d}")
+            mirror.Label = f"PrimaryMirror_{i+1:02d}"
+            x_center = x_start + i * mirror_width
+            mirror.Shape = Part.makeBox(
+                mirror_width,
+                MIRROR_LENGTH_M,
+                mirror_thickness,
+                FreeCAD.Vector(x_center - mirror_width / 2.0, -MIRROR_LENGTH_M / 2.0, 0.0),
+                FreeCAD.Vector(1.0, 0.0, 0.0),
+                FreeCAD.Vector(0.0, 0.0, 1.0),
+            )
+            mirrors.append(mirror)
+
+        self._doc.recompute()
+
+        self._sel = [absorber, glass, cpc, *mirrors]
+        scene = otsun.Scene(self._sel)
+
+        # 按用户要求保存关键对象
+        self.scene = scene
+        self.mirrors = mirrors
+        self.light_source = None
+
+        # 兼容现有成员命名
+        self._ots_scene = scene
+        self._ots_absorber = absorber
+        self._ots_cpc = cpc
+        self._ots_mirrors = mirrors
 
         for i, mirror in enumerate(self._ots_mirrors):
-            base = mirror.Placement.Base
-            self._mirror_centers[i] = np.array([base.x, base.y, base.z], dtype=np.float64)
+            bbox = mirror.Shape.BoundBox
+            self._mirror_centers[i] = np.array([bbox.Center.x, bbox.Center.y, bbox.Center.z], dtype=np.float64)
 
         self._spectrum_cdf = otsun.cdf_from_pdf_file(os.path.join("data", "ASTMG173-direct.txt"))
         self._direction_distribution = otsun.buie_distribution(0.05)
@@ -325,6 +377,8 @@ class LFROTSunEnv(gym.Env):
             1.0,
             self._direction_distribution,
         )
+        self.light_source = self._ots_light
+
 
     def _sun_direction(self, alpha_s_deg: float, gamma_s_deg: float) -> np.ndarray:
         """将高度角/方位角转成从太阳指向地面的单位向量。"""
