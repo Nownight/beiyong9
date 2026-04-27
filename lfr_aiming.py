@@ -16,6 +16,7 @@ LFR Annual AI-Driven Aiming Strategy Optimization
 
 import os
 import sys
+import ast
 import json
 import pickle
 import threading
@@ -1851,6 +1852,93 @@ def stage_annual(cfg: Config, df: pd.DataFrame, cluster_data: dict,
 
 # ==================== 10. 图表导出 ====================
 
+def _safe_parse_aim_vector(raw_aim):
+    """将 aim_optimal 安全解析为一维 numpy 向量"""
+    if isinstance(raw_aim, str):
+        try:
+            parsed = ast.literal_eval(raw_aim)
+        except Exception as e:
+            raise ValueError(f"无法解析字符串形式的 aim_optimal: {raw_aim}") from e
+        aim = np.asarray(parsed, dtype=np.float64).ravel()
+    else:
+        aim = np.asarray(raw_aim, dtype=np.float64).ravel()
+    if aim.size == 0:
+        raise ValueError("aim_optimal 为空向量")
+    return aim
+
+
+def expand_aim_to_full(aim, cfg):
+    """
+    将策略输出的 aim 向量统一展开成 cfg.n_mirrors 维。
+    """
+    aim = np.asarray(aim, dtype=np.float64).ravel()
+    if aim.size == cfg.n_mirrors:
+        return aim
+    if cfg.n_mirrors % 2 == 0 and aim.size == cfg.n_mirrors // 2:
+        return np.concatenate([aim[::-1], aim])
+    raise ValueError(
+        f"aim 向量维度不匹配: len(aim)={aim.size}, "
+        f"cfg.n_mirrors={cfg.n_mirrors}, cfg.use_symmetry={cfg.use_symmetry}"
+    )
+
+
+def compute_tonatiuh_mirror_pose(cfg, geo, mirror_id, sun_alt_deg, sun_az_deg, z_aim):
+    """
+    根据当前 Python 模型坐标系，计算 Tonatiuh 手动验证所需姿态参数。
+    """
+    del cfg  # 接口保留 cfg 以便未来扩展
+    if mirror_id < 0 or mirror_id >= len(geo.mirror_x):
+        raise ValueError(f"mirror_id 越界: {mirror_id}, n_mirrors={len(geo.mirror_x)}")
+
+    mirror_center = np.array([geo.mirror_x[mirror_id], 0.0, 0.0], dtype=np.float64)
+    target_point = np.array([0.0, float(z_aim), geo.cpc_y], dtype=np.float64)
+
+    alt = np.deg2rad(float(sun_alt_deg))
+    az = np.deg2rad(float(sun_az_deg))
+    sun_x = -np.cos(alt) * np.sin(az)
+    sun_y = -np.cos(alt) * np.cos(az)
+    sun_z = -np.sin(alt)
+    incoming_raw = np.array([sun_x, sun_y, sun_z], dtype=np.float64)
+    in_norm = np.linalg.norm(incoming_raw)
+    if in_norm < 1e-12:
+        raise ValueError("太阳入射向量长度过小，无法归一化")
+    incoming_dir = incoming_raw / in_norm
+
+    outgoing_raw = target_point - mirror_center
+    out_norm = np.linalg.norm(outgoing_raw)
+    if out_norm < 1e-12:
+        raise ValueError(
+            f"反射目标向量长度过小: mirror_id={mirror_id}, "
+            f"mirror_center={mirror_center.tolist()}, target_point={target_point.tolist()}"
+        )
+    outgoing_dir = outgoing_raw / out_norm
+
+    normal_raw = outgoing_dir - incoming_dir
+    normal_norm = np.linalg.norm(normal_raw)
+    if normal_norm < 1e-12:
+        raise ValueError(
+            f"镜面法向量长度过小: mirror_id={mirror_id}, "
+            f"sun_alt_deg={sun_alt_deg}, sun_az_deg={sun_az_deg}, z_aim={z_aim}"
+        )
+    normal = normal_raw / normal_norm
+
+    tilt_xz_deg = float(np.rad2deg(np.arctan2(normal[0], normal[2])))
+    cant_y_deg = float(np.rad2deg(np.arctan2(normal[1], np.sqrt(normal[0]**2 + normal[2]**2))))
+
+    return {
+        "mirror_x": float(mirror_center[0]),
+        "mirror_y": float(mirror_center[1]),
+        "mirror_z": float(mirror_center[2]),
+        "target_x": float(target_point[0]),
+        "target_y": float(target_point[1]),
+        "target_z": float(target_point[2]),
+        "normal_x": float(normal[0]),
+        "normal_y": float(normal[1]),
+        "normal_z": float(normal[2]),
+        "tilt_xz_deg": tilt_xz_deg,
+        "cant_y_deg": cant_y_deg
+    }
+
 def export_figures_and_tables(cfg: Config, df: pd.DataFrame, cluster_data: dict,
                                baselines: dict, bo_data: dict, history: dict,
                                formulas: dict, annual: dict, logger: Logger):
@@ -2055,84 +2143,202 @@ def export_figures_and_tables(cfg: Config, df: pd.DataFrame, cluster_data: dict,
     save_bilingual_figure(fig_dir / 'fig11_annual_heatmap.png', draw_fig11)
     
     # === 给 Tonatiuh 的瞄准向量导出 ===
-    export_aim_for_tonatiuh(cfg, cluster_data, bo_data, formulas, workdir)
+    export_tonatiuh_all_training_cases(cfg, cluster_data, bo_data, formulas, workdir)
     
     logger.info(f"图表已保存到 {fig_dir} 与 {tab_dir}")
 
 
-def export_aim_for_tonatiuh(cfg, cluster_data, bo_data, formulas, workdir):
-    """导出 4 种策略的瞄准向量 CSV,供 Tonatiuh 手动建模验证"""
-    rep_df = cluster_data['representatives']
-    samples = bo_data['samples']
+def export_tonatiuh_all_training_cases(cfg, cluster_data, bo_data, formulas, workdir):
+    """导出 bo_data['samples'] 全部 BO 训练/优化样本的 Tonatiuh 手动验证数据。"""
+    del cluster_data, formulas  # 该导出仅依赖 bo_data 样本
+    samples = bo_data['samples'].copy()
+    samples = samples.sort_values(['cluster', 'sample_idx']).reset_index(drop=True)
     out_dir = workdir / 'tonatiuh_aiming'
     out_dir.mkdir(exist_ok=True)
-    
-    rows_s1 = []; rows_s2 = []; rows_bo = []
-    for _, rep in rep_df.iterrows():
-        c = rep['cluster']
-        ts = rep['rep_timestamp']
-        # S1
-        for i in range(cfg.n_mirrors):
-            rows_s1.append({'time': ts, 'cluster': c, 'mirror_id': i, 'z_aim': 0.0})
-        # S2 均匀
-        z_uniform = np.linspace(-cfg.mirror_length*0.4, cfg.mirror_length*0.4, cfg.n_mirrors)
-        for i in range(cfg.n_mirrors):
-            rows_s2.append({'time': ts, 'cluster': c, 'mirror_id': i, 'z_aim': z_uniform[i]})
-        # BO knee (从 samples 取簇平均)
-        c_samples = samples[samples['cluster'] == c]
-        if len(c_samples) > 0:
-            aims_raw = c_samples['aim_optimal'].tolist()
-            # 防御: 维度不一致时取最常见维度
-            dims_seen = [len(a) for a in aims_raw]
-            if len(set(dims_seen)) > 1:
-                from collections import Counter
-                most_common_dim = Counter(dims_seen).most_common(1)[0][0]
-                aims_raw = [a for a in aims_raw if len(a) == most_common_dim]
-            if len(aims_raw) == 0:
-                continue
-            aims = np.array(aims_raw, dtype=np.float64)
-            mean_aim_half = aims.mean(axis=0)
-            if cfg.use_symmetry:
-                full_aim = np.concatenate([mean_aim_half[::-1], mean_aim_half])
-            else:
-                full_aim = mean_aim_half
-            for i in range(cfg.n_mirrors):
-                rows_bo.append({'time': ts, 'cluster': c, 'mirror_id': i, 'z_aim': float(full_aim[i])})
-    
-    pd.DataFrame(rows_s1).to_csv(out_dir / 'aiming_S1_center.csv', index=False)
-    pd.DataFrame(rows_s2).to_csv(out_dir / 'aiming_S2_uniform.csv', index=False)
-    pd.DataFrame(rows_bo).to_csv(out_dir / 'aiming_BO_optimal.csv', index=False)
-    
-    # 公式文件
-    if formulas:
-        with open(out_dir / 'formulas.json', 'w') as f:
-            json.dump(formulas, f, indent=2)
-    
-    # README
-    readme = f"""# Tonatiuh 验证瞄准向量
+    geo = LFRGeometry(cfg)
 
-包含 3 种策略在 {len(rep_df)} 个代表时刻的瞄准偏移量。
+    def _norm_series(s):
+        s = s.astype(float)
+        smin = s.min()
+        smax = s.max()
+        if np.isclose(smax, smin):
+            return pd.Series(np.zeros(len(s)), index=s.index, dtype=np.float64)
+        return (s - smin) / (smax - smin)
 
-## 文件
-- `aiming_S1_center.csv`  : 全瞄管心(基线 1)
-- `aiming_S2_uniform.csv` : 沿管轴均匀分布(基线 2)
-- `aiming_BO_optimal.csv` : 多目标 BO 优化(本文方法)
-- `formulas.json`         : 符号回归得到的解析公式
+    rows_bo = []
+    rows_s1 = []
+    rows_s2 = []
+    index_rows = []
+    raw_aim_dim_counts = {}
+    any_expanded = False
+    s2_full_aim = np.linspace(-cfg.mirror_length * 0.4, cfg.mirror_length * 0.4, cfg.n_mirrors)
 
-## CSV 列
-- `time`     : 代表时刻(用于 Tonatiuh 太阳位置设置)
-- `cluster`  : 聚类编号
-- `mirror_id`: 镜子编号(0 到 {cfg.n_mirrors-1},从最西到最东)
-- `z_aim`   : 沿集热管轴向的瞄准偏移量(m),范围 [{cfg.z_range[0]}, {cfg.z_range[1]}]
+    n_dni = _norm_series(samples['DNI'])
+    n_eta = _norm_series(samples['eta_opt'])
+    n_cv = _norm_series(samples['cv_circ'])
+    suggested_score = n_dni + n_eta - n_cv
 
-## 在 Tonatiuh 中如何使用
-1. 建立同样的 LFR + CPC 几何(参数见主代码 Config)
-2. 设置太阳方位为 `time` 对应敦煌位置
-3. 对每面镜子,瞄准点 = (0, z_aim, cpc_inlet_height) 全局坐标
-4. 运行 MCRT(>1e6 光线),导出吸热管表面能流
-5. 与本代码的 baselines.pkl 中能流图对比 CV_circ
+    for bo_row_index, sample in samples.iterrows():
+        cluster = int(sample['cluster'])
+        sample_idx = int(sample['sample_idx'])
+        case_id = f"C{cluster:02d}_S{sample_idx:03d}_R{bo_row_index:04d}"
+
+        try:
+            raw_aim = _safe_parse_aim_vector(sample['aim_optimal'])
+            full_aim_bo = expand_aim_to_full(raw_aim, cfg)
+        except Exception as e:
+            raise ValueError(
+                f"解析/展开 aim_optimal 失败: bo_row_index={bo_row_index}, "
+                f"cluster={cluster}, sample_idx={sample_idx}"
+            ) from e
+
+        raw_dim = int(raw_aim.size)
+        full_dim = int(full_aim_bo.size)
+        raw_aim_dim_counts[str(raw_dim)] = raw_aim_dim_counts.get(str(raw_dim), 0) + 1
+        expanded_to_full = bool(full_dim == cfg.n_mirrors and raw_dim != cfg.n_mirrors)
+        any_expanded = any_expanded or expanded_to_full
+
+        row_common = {
+            'case_id': case_id,
+            'bo_row_index': int(bo_row_index),
+            'cluster': cluster,
+            'sample_idx': sample_idx,
+            'time': sample['timestamp'],
+            'solar_alt': float(sample['solar_alt']),
+            'solar_az': float(sample['solar_az']),
+            'DNI': float(sample['DNI']),
+            'cos_inc': float(sample['cos_inc']),
+            'eta_opt': float(sample['eta_opt']),
+            'cv_circ': float(sample['cv_circ']),
+            'aim_vector_dim_raw': raw_dim,
+            'aim_vector_dim_full': full_dim,
+        }
+        index_rows.append({
+            **{k: row_common[k] for k in [
+                'case_id', 'bo_row_index', 'cluster', 'sample_idx', 'time',
+                'solar_alt', 'solar_az', 'DNI', 'cos_inc', 'eta_opt',
+                'cv_circ', 'aim_vector_dim_raw'
+            ]},
+            'expanded_to_n_mirrors': expanded_to_full,
+            'suggested_sort_score': float(suggested_score.iloc[bo_row_index])
+        })
+
+        for mirror_id in range(cfg.n_mirrors):
+            z_bo = float(full_aim_bo[mirror_id])
+            z_s1 = 0.0
+            z_s2 = float(s2_full_aim[mirror_id])
+            pose_bo = compute_tonatiuh_mirror_pose(cfg, geo, mirror_id, sample['solar_alt'], sample['solar_az'], z_bo)
+            pose_s1 = compute_tonatiuh_mirror_pose(cfg, geo, mirror_id, sample['solar_alt'], sample['solar_az'], z_s1)
+            pose_s2 = compute_tonatiuh_mirror_pose(cfg, geo, mirror_id, sample['solar_alt'], sample['solar_az'], z_s2)
+
+            rows_bo.append({
+                **row_common,
+                'strategy': 'BO',
+                'mirror_id': mirror_id,
+                'z_aim': z_bo,
+                **pose_bo,
+                'note': "BO optimized aiming from bo_data['samples']"
+            })
+            rows_s1.append({
+                **row_common,
+                'strategy': 'S1_center',
+                'mirror_id': mirror_id,
+                'z_aim': z_s1,
+                **pose_s1,
+                'note': "Baseline S1: center aiming"
+            })
+            rows_s2.append({
+                **row_common,
+                'strategy': 'S2_uniform',
+                'mirror_id': mirror_id,
+                'z_aim': z_s2,
+                **pose_s2,
+                'note': "Baseline S2: uniform longitudinal aiming"
+            })
+
+    bo_df = pd.DataFrame(rows_bo)
+    s1_df = pd.DataFrame(rows_s1)
+    s2_df = pd.DataFrame(rows_s2)
+    index_df = pd.DataFrame(index_rows)
+
+    expected_rows = len(samples) * cfg.n_mirrors
+    if len(bo_df) != expected_rows:
+        raise ValueError(f"BO CSV 行数不一致: got={len(bo_df)}, expected={expected_rows}")
+    if len(s1_df) != expected_rows:
+        raise ValueError(f"S1 CSV 行数不一致: got={len(s1_df)}, expected={expected_rows}")
+    if len(s2_df) != expected_rows:
+        raise ValueError(f"S2 CSV 行数不一致: got={len(s2_df)}, expected={expected_rows}")
+
+    bo_name = 'tonatiuh_all_training_cases_BO.csv'
+    s1_name = 'tonatiuh_all_training_cases_S1_center.csv'
+    s2_name = 'tonatiuh_all_training_cases_S2_uniform.csv'
+    index_name = 'tonatiuh_training_cases_index.csv'
+    manifest_name = 'tonatiuh_export_manifest.json'
+    readme_name = 'README.md'
+
+    bo_df.to_csv(out_dir / bo_name, index=False)
+    s1_df.to_csv(out_dir / s1_name, index=False)
+    s2_df.to_csv(out_dir / s2_name, index=False)
+    index_df.to_csv(out_dir / index_name, index=False)
+
+    manifest = {
+        "n_samples": int(len(samples)),
+        "n_mirrors": int(cfg.n_mirrors),
+        "expected_rows_per_strategy": int(expected_rows),
+        "bo_rows": int(len(bo_df)),
+        "s1_rows": int(len(s1_df)),
+        "s2_rows": int(len(s2_df)),
+        "raw_aim_dim_counts": raw_aim_dim_counts,
+        "expanded_aim_dim": int(cfg.n_mirrors),
+        "expanded_happened": any_expanded,
+        "use_symmetry_current_cfg": bool(cfg.use_symmetry),
+        "exported_files": [bo_name, s1_name, s2_name, index_name, manifest_name, readme_name],
+        "created_at": datetime.now().isoformat()
+    }
+    with open(out_dir / manifest_name, 'w', encoding='utf-8') as f:
+        json.dump(manifest, f, indent=2, ensure_ascii=False)
+
+    readme = f"""# Tonatiuh 手动验证导出说明
+
+本目录导出的是 `bo_dataset.pkl` / `bo_data['samples']` 中**所有** BO 训练/优化过的样本时刻，而不是 cluster representatives。
+默认配置下通常是 `12 clusters × 20 samples_per_cluster = 240` 个样本时刻，但实际样本数请以 `tonatiuh_training_cases_index.csv` 为准。
+
+## 文件说明
+
+- `tonatiuh_all_training_cases_S1_center.csv`：基线 1，全瞄管心。
+- `tonatiuh_all_training_cases_S2_uniform.csv`：基线 2，沿管轴均匀分布。
+- `tonatiuh_all_training_cases_BO.csv`：本文方法，BO 优化得到的 longitudinal aiming 策略。
+- `tonatiuh_training_cases_index.csv`：case 索引（每行一个 BO 样本时刻），便于后续筛选。
+- `tonatiuh_export_manifest.json`：导出统计、行数校验、维度统计与时间戳。
+
+## 行含义与关键变量
+
+每个策略 CSV 中，一行对应“一个样本时刻 + 一面镜子”的 Tonatiuh 手动设置参数。
+Python 策略优化变量 `z_aim` 不是直接镜面倾角，而是沿集热管轴向的瞄准偏移量。
+
+对每面镜推荐优先使用目标点：
+`target_point = (target_x, target_y, target_z)`，其中：
+- `target_x = 0`
+- `target_y = z_aim`
+- `target_z = cpc_inlet_height / geo.cpc_y`（本导出中实际使用 Python 几何的 `geo.cpc_y`）
+
+如果 Tonatiuh 支持“让镜子瞄准某个目标点”，优先使用 `target_x, target_y, target_z`。
+如果 Tonatiuh 只能手动输入角度：
+- `tilt_xz_deg`：横截面等效一轴倾角；
+- `cant_y_deg`：轴向瞄准引入的三维偏转。
+仅输入 `tilt_xz_deg` 可能无法完全复现 Python 的 longitudinal aiming。
+
+## 推荐验证流程
+
+1. 从 `tonatiuh_training_cases_index.csv` 中选择若干 `case_id`。
+2. 在 Tonatiuh 中建立与 Python Config 相同的 LFR + CPC + 吸热管模型。
+3. 设置对应 `time / solar_alt / solar_az / DNI`。
+4. 对每面镜设置目标点或姿态。
+5. 分别运行 `S1_center`、`S2_uniform`、`BO`。
+6. 比较吸热管表面能流均匀性。
+7. 用 BO 相对于 S1/S2 的能流均匀性改善验证策略可行性。
 """
-    with open(out_dir / 'README.md', 'w') as f:
+    with open(out_dir / readme_name, 'w', encoding='utf-8') as f:
         f.write(readme)
 
 
