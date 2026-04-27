@@ -1639,7 +1639,7 @@ def stage_bo(cfg: Config, df: pd.DataFrame, cluster_data: dict,
                 'bo_selected_reason': selected_reason,
                 's1_eta_opt': float(s1_metrics['eta_opt']),
                 's1_sigma_surface': float(s1_metrics['sigma_surface']),
-                's1_cv_circ': float(s1_y[1]),
+                's1_cv_circ': float(s1_metrics['cv_circ']),
                 'eta_floor_rel': float(cfg.bo_eta_floor_rel),
                 'timestamp': str(hour_row['timestamp']),
             })
