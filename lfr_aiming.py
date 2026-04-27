@@ -2153,6 +2153,20 @@ def export_tonatiuh_all_training_cases(cfg, cluster_data, bo_data, formulas, wor
     del cluster_data, formulas  # 该导出仅依赖 bo_data 样本
     samples = bo_data['samples'].copy()
     samples = samples.sort_values(['cluster', 'sample_idx']).reset_index(drop=True)
+
+    def _get_col_name(df, candidates, required=True):
+        for c in candidates:
+            if c in df.columns:
+                return c
+        if required:
+            raise KeyError(
+                f"缺少必要列，候选列名={candidates}, 当前列={list(df.columns)}"
+            )
+        return None
+
+    dni_col = _get_col_name(samples, ['dni', 'DNI'])
+    time_col = _get_col_name(samples, ['timestamp', 'time'])
+
     out_dir = workdir / 'tonatiuh_aiming'
     out_dir.mkdir(exist_ok=True)
     geo = LFRGeometry(cfg)
@@ -2173,7 +2187,7 @@ def export_tonatiuh_all_training_cases(cfg, cluster_data, bo_data, formulas, wor
     any_expanded = False
     s2_full_aim = np.linspace(-cfg.mirror_length * 0.4, cfg.mirror_length * 0.4, cfg.n_mirrors)
 
-    n_dni = _norm_series(samples['DNI'])
+    n_dni = _norm_series(samples[dni_col])
     n_eta = _norm_series(samples['eta_opt'])
     n_cv = _norm_series(samples['cv_circ'])
     suggested_score = n_dni + n_eta - n_cv
@@ -2203,10 +2217,10 @@ def export_tonatiuh_all_training_cases(cfg, cluster_data, bo_data, formulas, wor
             'bo_row_index': int(bo_row_index),
             'cluster': cluster,
             'sample_idx': sample_idx,
-            'time': sample['timestamp'],
+            'time': sample[time_col],
             'solar_alt': float(sample['solar_alt']),
             'solar_az': float(sample['solar_az']),
-            'DNI': float(sample['DNI']),
+            'DNI': float(sample[dni_col]),
             'cos_inc': float(sample['cos_inc']),
             'eta_opt': float(sample['eta_opt']),
             'cv_circ': float(sample['cv_circ']),
