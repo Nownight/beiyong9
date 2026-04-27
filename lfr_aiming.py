@@ -201,6 +201,9 @@ class Config:
     bo_n_initial: int = 30
     bo_n_iterations: int = 80
     bo_ref_point: tuple = (0.30, -1.5)  # (eta_opt 最低, -CV 最高)
+    # BO label guard
+    bo_force_s1_initial: bool = True
+    bo_eta_floor_rel: float = 0.98
     
     # Transformer
     nn_d_model: int = 128
@@ -210,6 +213,9 @@ class Config:
     nn_epochs: int = 200
     nn_lr: float = 1e-3
     nn_val_ratio: float = 0.2
+    # NN early stopping
+    nn_early_stop_patience: int = 20
+    nn_min_delta: float = 1e-4
     
     # PySR
     pysr_iterations: int = 50
@@ -1282,7 +1288,7 @@ class SimpleMOBO:
         self.n_iter = n_iter
         self.rng = np.random.RandomState(seed)
     
-    def optimize(self, eval_fn, stop_check=None):
+    def optimize(self, eval_fn, stop_check=None, initial_points=None):
         """eval_fn(x) -> (eta_opt, cv_circ)
         返回: (X_history, Y_history, knee_x, knee_y)
         """
@@ -1290,10 +1296,19 @@ class SimpleMOBO:
             from sklearn.gaussian_process import GaussianProcessRegressor
             from sklearn.gaussian_process.kernels import Matern, ConstantKernel as C
         except ImportError:
-            return self._random_search(eval_fn, stop_check)
+            return self._random_search(eval_fn, stop_check, initial_points=initial_points)
         
-        # 初始拉丁超立方
-        X = self._latin_hypercube(self.n_initial)
+        # 初始点: 外部给定 + 拉丁超立方
+        if initial_points is not None and len(initial_points) > 0:
+            initial_points = np.asarray(initial_points, dtype=float).reshape(-1, self.dim)
+            n_lhs = max(0, self.n_initial - len(initial_points))
+            X_lhs = self._latin_hypercube(n_lhs) if n_lhs > 0 else np.empty((0, self.dim))
+            X = np.vstack([initial_points, X_lhs])
+        else:
+            X = self._latin_hypercube(self.n_initial)
+        X_round = np.round(X, 8)
+        _, unique_idx = np.unique(X_round, axis=0, return_index=True)
+        X = X[np.sort(unique_idx)]
         Y = np.array([self._safe_eval(eval_fn, x, stop_check) for x in X])
         
         for it in range(self.n_iter):
@@ -1362,8 +1377,16 @@ class SimpleMOBO:
             self.rng.shuffle(rdp[:, j])
         return self.bounds[:, 0] + rdp * (self.bounds[:, 1] - self.bounds[:, 0])
     
-    def _random_search(self, eval_fn, stop_check):
-        X = self._latin_hypercube(self.n_initial + self.n_iter)
+    def _random_search(self, eval_fn, stop_check, initial_points=None):
+        X_rand = self._latin_hypercube(self.n_initial + self.n_iter)
+        if initial_points is not None and len(initial_points) > 0:
+            initial_points = np.asarray(initial_points, dtype=float).reshape(-1, self.dim)
+            X = np.vstack([initial_points, X_rand])
+        else:
+            X = X_rand
+        X_round = np.round(X, 8)
+        _, unique_idx = np.unique(X_round, axis=0, return_index=True)
+        X = X[np.sort(unique_idx)]
         Y = np.array([self._safe_eval(eval_fn, x, stop_check) for x in X])
         pareto_mask = self._pareto_mask(Y)
         knee_x = X[0]
@@ -1393,6 +1416,28 @@ class SimpleMOBO:
                     mask[i] = False
                     break
         return mask
+
+
+def select_bo_label_with_s1_guard(X, Y, pareto_mask, x_s1, eta_floor_rel=0.98):
+    """
+    从 BO 历史中选择最终训练标签。
+    """
+    X = np.asarray(X, dtype=float)
+    Y = np.asarray(Y, dtype=float)
+    x_s1 = np.asarray(x_s1, dtype=float).ravel()
+    s1_idx = int(np.argmin(np.linalg.norm(X - x_s1[None, :], axis=1)))
+    s1_y = Y[s1_idx]
+    s1_eta = float(s1_y[0])
+    eta_floor = s1_eta * eta_floor_rel if s1_eta > 0 else s1_eta
+    pareto_idx = np.where(pareto_mask)[0]
+    feasible_idx = pareto_idx[Y[pareto_idx, 0] >= eta_floor]
+    if len(feasible_idx) > 0:
+        best_idx = feasible_idx[np.argmin(Y[feasible_idx, 1])]
+        reason = 'pareto_min_cv_eta_floor'
+    else:
+        best_idx = s1_idx
+        reason = 'fallback_s1_no_pareto_eta_floor'
+    return X[best_idx], Y[best_idx], reason, s1_y
 
 
 def stage_bo(cfg: Config, df: pd.DataFrame, cluster_data: dict,
@@ -1459,7 +1504,16 @@ def stage_bo(cfg: Config, df: pd.DataFrame, cluster_data: dict,
             
             bo = SimpleMOBO(dim, bounds, n_initial=cfg.bo_n_initial,
                            n_iter=cfg.bo_n_iterations, seed=cfg.seed + ci * 100 + si)
-            X, Y, knee_x, knee_y, pmask = bo.optimize(eval_fn, stop_check=stop.check)
+            x_s1 = np.zeros(dim)
+            initial_points = [x_s1] if cfg.bo_force_s1_initial else None
+            X, Y, knee_x, knee_y, pmask = bo.optimize(
+                eval_fn,
+                stop_check=stop.check,
+                initial_points=initial_points,
+            )
+            selected_x, selected_y, selected_reason, s1_y = select_bo_label_with_s1_guard(
+                X, Y, pmask, x_s1, eta_floor_rel=cfg.bo_eta_floor_rel
+            )
             
             samples.append({
                 'cluster': int(cluster_id),
@@ -1468,9 +1522,13 @@ def stage_bo(cfg: Config, df: pd.DataFrame, cluster_data: dict,
                 'solar_az': float(hour_row['solar_az']),
                 'cos_inc': float(hour_row['cos_inc']),
                 'dni': float(hour_row['DNI']),
-                'aim_optimal': knee_x.tolist(),
-                'eta_opt': float(knee_y[0]),
-                'cv_circ': float(knee_y[1]),
+                'aim_optimal': selected_x.tolist(),
+                'eta_opt': float(selected_y[0]),
+                'cv_circ': float(selected_y[1]),
+                'bo_selected_reason': selected_reason,
+                's1_eta_opt': float(s1_y[0]),
+                's1_cv_circ': float(s1_y[1]),
+                'eta_floor_rel': float(cfg.bo_eta_floor_rel),
                 'timestamp': str(hour_row['timestamp']),
             })
             if cluster_id not in pareto_data:
@@ -1484,7 +1542,11 @@ def stage_bo(cfg: Config, df: pd.DataFrame, cluster_data: dict,
             ckpt.set_partial('bo', 'done_pairs', list(done_pairs))
             
             cur = len(samples)
-            logger.progress(cur / total, f"BO 簇{cluster_id} 样本{si+1}/{n_pick} (η={knee_y[0]:.3f}, CV={knee_y[1]:.3f})")
+            logger.progress(
+                cur / total,
+                f"BO 簇{cluster_id} 样本{si+1}/{n_pick} "
+                f"(η={selected_y[0]:.3f}, CV={selected_y[1]:.3f}, {selected_reason})"
+            )
     
     out = {'samples': pd.DataFrame(samples), 'pareto_data': pareto_data, 'dim': dim}
     with open(out_path, 'wb') as f:
@@ -1602,6 +1664,9 @@ def stage_train(cfg: Config, bo_data: dict, logger: Logger,
     
     history = {'train_loss': [], 'val_loss': [], 'val_mae': []}
     best_val = float('inf')
+    best_epoch = ckpt.get_partial('train', 'best_epoch', -1)
+    epochs_no_improve = ckpt.get_partial('train', 'epochs_no_improve', 0)
+    early_stopped = False
     
     # 恢复进度
     start_epoch = ckpt.get_partial('train', 'epoch', 0)
@@ -1609,6 +1674,8 @@ def stage_train(cfg: Config, bo_data: dict, logger: Logger,
         model.load_state_dict(torch.load(out_path, map_location=device))
         history = ckpt.get_partial('train', 'history', history)
         best_val = ckpt.get_partial('train', 'best_val', best_val)
+        best_epoch = ckpt.get_partial('train', 'best_epoch', best_epoch)
+        epochs_no_improve = ckpt.get_partial('train', 'epochs_no_improve', epochs_no_improve)
         logger.info(f"从 epoch {start_epoch} 续训")
     
     for epoch in range(start_epoch, cfg.nn_epochs):
@@ -1641,18 +1708,34 @@ def stage_train(cfg: Config, bo_data: dict, logger: Logger,
         history['val_loss'].append(val_loss)
         history['val_mae'].append(val_mae)
         
-        if val_loss < best_val:
+        if val_loss < best_val - cfg.nn_min_delta:
             best_val = val_loss
+            best_epoch = epoch + 1
+            epochs_no_improve = 0
             torch.save(model.state_dict(), out_path)
+        else:
+            epochs_no_improve += 1
         
         ckpt.set_partial('train', 'epoch', epoch + 1)
         ckpt.set_partial('train', 'history', history)
         ckpt.set_partial('train', 'best_val', best_val)
+        ckpt.set_partial('train', 'best_epoch', best_epoch)
+        ckpt.set_partial('train', 'epochs_no_improve', epochs_no_improve)
         logger.progress((epoch + 1) / cfg.nn_epochs,
                        f"Epoch {epoch+1}/{cfg.nn_epochs} train={train_loss:.4f} val={val_loss:.4f}")
+        if epochs_no_improve >= cfg.nn_early_stop_patience:
+            early_stopped = True
+            logger.info(
+                f"Early stopping at epoch {epoch + 1}, "
+                f"best_epoch={best_epoch}, best_val={best_val:.4f}"
+            )
+            break
     
     # 保存归一化参数
     np.savez(workdir / 'norm.npz', X_mean=X_mean, X_std=X_std)
+    history['best_epoch'] = best_epoch
+    history['early_stopped'] = early_stopped
+    history['best_val'] = float(best_val)
     with open(history_path, 'w') as f:
         json.dump(history, f, indent=2)
     
@@ -1775,6 +1858,7 @@ def stage_annual(cfg: Config, df: pd.DataFrame, cluster_data: dict,
     mcrt = MCRTTracer(cfg, geo)
     
     annual_records = []
+    annual_detail_records = []
     
     # 基线 S1, S2
     for sname in ['S1_center', 'S2_uniform']:
@@ -1811,10 +1895,7 @@ def stage_annual(cfg: Config, df: pd.DataFrame, cluster_data: dict,
                     torch.from_numpy(x_in.astype(np.float32)).to(device),
                     torch.tensor([cluster_id], dtype=torch.long).to(device)
                 ).cpu().numpy()[0]
-            if cfg.use_symmetry:
-                aim = np.concatenate([aim_half[::-1], aim_half])
-            else:
-                aim = aim_half
+            aim = expand_aim_to_full(aim_half, cfg)
             _, m = mcrt.trace(row['solar_alt'], row['solar_az'], aim, row['DNI'],
                              n_rays=cfg.n_rays_validate)
             eta_total += weights[cluster_id] * m['eta_opt']
@@ -1827,11 +1908,46 @@ def stage_annual(cfg: Config, df: pd.DataFrame, cluster_data: dict,
             'annual_cv_circ': cv_total,
         })
     
-    # BO knee 策略(直接加权 BO 数据)
-    samples = bo_data['samples']
-    bo_grouped = samples.groupby('cluster').agg({'eta_opt': 'mean', 'cv_circ': 'mean'})
-    eta_bo = sum(weights[c] * bo_grouped.loc[c, 'eta_opt'] for c in bo_grouped.index)
-    cv_bo = sum(weights[c] * bo_grouped.loc[c, 'cv_circ'] for c in bo_grouped.index)
+    # BO knee 策略: 在代表时刻做同口径验证
+    samples = bo_data['samples'].copy()
+    dni_col = 'dni' if 'dni' in samples.columns else 'DNI'
+    eta_bo = 0.0
+    cv_bo = 0.0
+    for _, rep in rep_df.iterrows():
+        cluster_id = rep['cluster']
+        row = cluster_data['df'].iloc[rep['rep_idx']]
+        c_samples = samples[samples['cluster'] == cluster_id]
+        if len(c_samples) == 0:
+            aim = np.zeros(cfg.n_mirrors)
+            source_sample_idx = -1
+            dist_min = float('nan')
+            lookup_reason = 'fallback_s1_no_bo_sample'
+        else:
+            sample_feats = c_samples[['solar_alt', 'solar_az', 'cos_inc', dni_col]].values.astype(float)
+            target_feat = np.array([row['solar_alt'], row['solar_az'], row['cos_inc'], row['DNI']], dtype=float)
+            scale = sample_feats.std(axis=0) + 1e-6
+            dist = np.linalg.norm((sample_feats - target_feat[None, :]) / scale, axis=1)
+            nearest = c_samples.iloc[int(np.argmin(dist))]
+            aim_raw = _safe_parse_aim_vector(nearest['aim_optimal'])
+            aim = expand_aim_to_full(aim_raw, cfg)
+            source_sample_idx = int(nearest['sample_idx'])
+            dist_min = float(np.min(dist))
+            lookup_reason = 'nearest_bo_sample_same_cluster'
+        _, m = mcrt.trace(row['solar_alt'], row['solar_az'], aim, row['DNI'],
+                         n_rays=cfg.n_rays_validate)
+        eta_bo += weights[cluster_id] * m['eta_opt']
+        cv_bo += weights[cluster_id] * m['cv_circ']
+        annual_detail_records.append({
+            'cluster': int(cluster_id),
+            'strategy': 'BO_Knee',
+            'eta_opt': float(m['eta_opt']),
+            'cv_circ': float(m['cv_circ']),
+            'source_sample_idx': source_sample_idx,
+            'distance_to_rep': dist_min,
+            'lookup_reason': lookup_reason,
+            'weight': float(weights[cluster_id]),
+        })
+        stop.check()
     annual_records.append({
         'strategy': 'BO_Knee',
         'annual_eta_opt': eta_bo,
@@ -1839,7 +1955,11 @@ def stage_annual(cfg: Config, df: pd.DataFrame, cluster_data: dict,
     })
     
     annual_df = pd.DataFrame(annual_records)
-    out = {'annual_summary': annual_df, 'baselines': baselines}
+    out = {
+        'annual_summary': annual_df,
+        'annual_details': pd.DataFrame(annual_detail_records),
+        'baselines': baselines
+    }
     with open(out_path, 'wb') as f:
         pickle.dump(out, f)
     ckpt.mark_done('annual')
@@ -2042,6 +2162,17 @@ def export_figures_and_tables(cfg: Config, df: pd.DataFrame, cluster_data: dict,
                                  values=['eta_opt', 'cv_circ', 'nuf', 'par'])
     pivot.to_csv(tab_dir / 'tab02_baseline.csv')
     
+    # === 表 3: BO 选择诊断 ===
+    samples_diag = bo_data['samples']
+    required_diag_cols = {'bo_selected_reason', 's1_eta_opt', 's1_cv_circ'}
+    if required_diag_cols.issubset(set(samples_diag.columns)):
+        diag_cols = [
+            'cluster', 'sample_idx', 'timestamp', 'eta_opt', 'cv_circ',
+            's1_eta_opt', 's1_cv_circ', 'bo_selected_reason', 'eta_floor_rel'
+        ]
+        keep_cols = [c for c in diag_cols if c in samples_diag.columns]
+        samples_diag[keep_cols].to_csv(tab_dir / 'tab03_bo_selection_diagnostics.csv', index=False)
+    
     # === 图 5: Pareto 前沿 ===
     pareto_data = bo_data['pareto_data']
     def draw_fig05(lang):
@@ -2117,6 +2248,10 @@ def export_figures_and_tables(cfg: Config, df: pd.DataFrame, cluster_data: dict,
         
         adf.to_csv(tab_dir / 'tab06_annual.csv', index=False)
         adf.to_markdown(tab_dir / 'tab06_annual.md', index=False)
+        if isinstance(annual, dict) and 'annual_details' in annual:
+            annual_details = annual['annual_details']
+            if isinstance(annual_details, pd.DataFrame):
+                annual_details.to_csv(tab_dir / 'tab07_annual_details.csv', index=False)
     
     # === 图 11: 年度热力图(基于 BO 样本估计) ===
     samples = bo_data['samples']
