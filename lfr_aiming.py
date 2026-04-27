@@ -22,6 +22,7 @@ import threading
 import time
 import queue
 import traceback
+import warnings
 from pathlib import Path
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta
@@ -33,6 +34,12 @@ import matplotlib
 matplotlib.use('Agg')  # 非交互后端
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle
+from matplotlib import font_manager as fm
+
+try:
+    from scipy.linalg import LinAlgWarning
+except Exception:
+    LinAlgWarning = Warning
 
 # tkinter 可选 (Kaggle/Colab/无显示器环境无 tkinter)
 try:
@@ -71,6 +78,63 @@ try:
     HAS_PYSR = True
 except ImportError:
     HAS_PYSR = False
+
+
+def _pick_first_available_font(candidates):
+    """按优先级选可用字体,若都不可用则返回 None"""
+    available = {f.name for f in fm.fontManager.ttflist}
+    for name in candidates:
+        if name in available:
+            return name
+    return None
+
+
+ZH_FONT_CANDIDATES = ['SimSun', '宋体', 'NSimSun', 'Microsoft YaHei', 'SimHei', 'Noto Sans CJK SC']
+EN_FONT_CANDIDATES = ['Times New Roman', 'Times-Roman', 'Times', 'Nimbus Roman', 'DejaVu Serif']
+
+
+def _apply_plot_language_style(lang: str):
+    """按语言设置绘图样式并屏蔽常见字体告警"""
+    base = {
+        'font.size': 11,
+        'figure.dpi': 120,
+        'savefig.dpi': 300,
+        'axes.grid': True,
+        'grid.alpha': 0.3,
+        'axes.unicode_minus': False
+    }
+    if lang == 'zh':
+        zh_font = _pick_first_available_font(ZH_FONT_CANDIDATES)
+        if zh_font:
+            base.update({'font.family': 'sans-serif', 'font.sans-serif': [zh_font] + ZH_FONT_CANDIDATES})
+        else:
+            base.update({'font.family': 'sans-serif', 'font.sans-serif': ZH_FONT_CANDIDATES})
+    else:
+        en_font = _pick_first_available_font(EN_FONT_CANDIDATES)
+        base.update({'font.family': 'serif', 'font.serif': ([en_font] if en_font else []) + EN_FONT_CANDIDATES})
+    plt.rcParams.update(base)
+
+
+def save_bilingual_figure(output_path, draw_fn, dpi=300):
+    """
+    output_path: 原始基础路径，例如 fig_dir / 'fig01_cluster_pca.png'
+    draw_fn: 函数，接收 lang 参数，返回 fig
+             fig = draw_fn('zh')  # 中文图
+             fig = draw_fn('en')  # 英文图
+    保存：
+      fig01_cluster_pca_zh.png
+      fig01_cluster_pca_en.png
+    """
+    output_path = Path(output_path)
+    for lang in ('zh', 'en'):
+        _apply_plot_language_style(lang)
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore', message=r'Glyph .* missing from font\(s\).*', category=UserWarning)
+            fig = draw_fn(lang)
+            target = output_path.with_name(f"{output_path.stem}_{lang}{output_path.suffix}")
+            fig.tight_layout()
+            fig.savefig(target, dpi=dpi)
+            plt.close(fig)
 
 
 # ==================== 配置 ====================
@@ -1237,10 +1301,12 @@ class SimpleMOBO:
             # 训练两个 GP(对应 -eta 和 cv)
             try:
                 kernel = C(1.0) * Matern(length_scale=1.0, nu=2.5)
-                gp_eta = GaussianProcessRegressor(kernel=kernel, normalize_y=True, alpha=1e-4)
-                gp_eta.fit(X, -Y[:, 0])  # 最小化 -eta
-                gp_cv = GaussianProcessRegressor(kernel=kernel, normalize_y=True, alpha=1e-4)
-                gp_cv.fit(X, Y[:, 1])  # 最小化 cv
+                gp_eta = GaussianProcessRegressor(kernel=kernel, normalize_y=True, alpha=1e-3)
+                gp_cv = GaussianProcessRegressor(kernel=kernel, normalize_y=True, alpha=1e-3)
+                with warnings.catch_warnings():
+                    warnings.filterwarnings('ignore', category=LinAlgWarning)
+                    gp_eta.fit(X, -Y[:, 0])  # 最小化 -eta
+                    gp_cv.fit(X, Y[:, 1])  # 最小化 cv
                 
                 # 候选采样,用 ParEGO 思想: 随机权重标量化
                 w = self.rng.rand()
@@ -1796,42 +1862,45 @@ def export_figures_and_tables(cfg: Config, df: pd.DataFrame, cluster_data: dict,
     fig_dir.mkdir(exist_ok=True)
     tab_dir.mkdir(exist_ok=True)
     
-    plt.rcParams.update({'font.size': 11, 'figure.dpi': 120, 'savefig.dpi': 300,
-                         'axes.grid': True, 'grid.alpha': 0.3})
-    
     # === 图 1: 聚类 PCA ===
-    fig, ax = plt.subplots(figsize=(8, 6))
     Xpca = cluster_data['X_pca']
     labels = cluster_data['labels']
-    for k in range(cfg.n_clusters):
-        m = labels == k
-        ax.scatter(Xpca[m, 0], Xpca[m, 1], s=8, alpha=0.5, label=f'C{k}')
     centers = cluster_data['centers_pca']
-    ax.scatter(centers[:, 0], centers[:, 1], marker='X', s=200, c='red',
-               edgecolors='black', linewidths=1.5, label='代表时刻', zorder=5)
-    ax.set_xlabel('PC1'); ax.set_ylabel('PC2')
-    ax.set_title(f'Fig. 1 工况聚类(K={cfg.n_clusters}, Silhouette={cluster_data["silhouette"]:.2f})')
-    ax.legend(ncol=2, loc='best', fontsize=8)
-    plt.tight_layout()
-    plt.savefig(fig_dir / 'fig01_cluster_pca.png')
-    plt.close()
+    def draw_fig01(lang):
+        fig, ax = plt.subplots(figsize=(8, 6))
+        for k in range(cfg.n_clusters):
+            m = labels == k
+            ax.scatter(Xpca[m, 0], Xpca[m, 1], s=8, alpha=0.5, label=f'C{k}')
+        rep_label = '代表时刻' if lang == 'zh' else 'Representative points'
+        ax.scatter(centers[:, 0], centers[:, 1], marker='X', s=200, c='red',
+                   edgecolors='black', linewidths=1.5, label=rep_label, zorder=5)
+        ax.set_xlabel('主成分 1 (PC1)' if lang == 'zh' else 'PC1')
+        ax.set_ylabel('主成分 2 (PC2)' if lang == 'zh' else 'PC2')
+        title = (f'图1 工况聚类(K={cfg.n_clusters}, 轮廓系数={cluster_data["silhouette"]:.2f})'
+                 if lang == 'zh' else
+                 f'Fig. 1 Operating-condition clustering (K={cfg.n_clusters}, Silhouette={cluster_data["silhouette"]:.2f})')
+        ax.set_title(title)
+        ax.legend(ncol=2, loc='best', fontsize=8)
+        return fig
+    save_bilingual_figure(fig_dir / 'fig01_cluster_pca.png', draw_fig01)
     
     # === 图 2: 太阳轨迹 ===
-    fig, ax = plt.subplots(figsize=(7, 7), subplot_kw=dict(projection='polar'))
     rep_df = cluster_data['representatives']
     rep_full = cluster_data['df'].iloc[rep_df['rep_idx'].values]
     az_rad = np.deg2rad(rep_full['solar_az'].values)
     alt = rep_full['solar_alt'].values
-    sc = ax.scatter(az_rad, 90 - alt, c=rep_df['dni_mean'], s=200,
-                   cmap='YlOrRd', edgecolors='black')
-    ax.set_theta_zero_location('N'); ax.set_theta_direction(-1)
-    ax.set_title('Fig. 2 12 个代表时刻太阳轨迹')
-    plt.colorbar(sc, label='DNI (W/m²)')
-    for i, (_, r) in enumerate(rep_df.iterrows()):
-        ax.annotate(f"C{r['cluster']}", xy=(az_rad[i], 90 - alt[i]), fontsize=8)
-    plt.tight_layout()
-    plt.savefig(fig_dir / 'fig02_sun_path.png')
-    plt.close()
+    def draw_fig02(lang):
+        fig, ax = plt.subplots(figsize=(7, 7), subplot_kw=dict(projection='polar'))
+        sc = ax.scatter(az_rad, 90 - alt, c=rep_df['dni_mean'], s=200,
+                        cmap='YlOrRd', edgecolors='black')
+        ax.set_theta_zero_location('N'); ax.set_theta_direction(-1)
+        ax.set_title('图2 12个代表时刻太阳轨迹' if lang == 'zh' else 'Fig. 2 Solar trajectories of 12 representative instants')
+        fig.colorbar(sc, label='DNI (W/m²)')
+        for i, (_, r) in enumerate(rep_df.iterrows()):
+            prefix = '簇' if lang == 'zh' else 'C'
+            ax.annotate(f"{prefix}{r['cluster']}", xy=(az_rad[i], 90 - alt[i]), fontsize=8)
+        return fig
+    save_bilingual_figure(fig_dir / 'fig02_sun_path.png', draw_fig02)
     
     # === 表 1: 聚类统计 ===
     rep_df_out = rep_df[['cluster', 'rep_timestamp', 'dni_mean', 'dni_std',
@@ -1844,39 +1913,40 @@ def export_figures_and_tables(cfg: Config, df: pd.DataFrame, cluster_data: dict,
     # === 图 3: 基线能流云图 ===
     flux_maps = baselines['flux_maps']
     core_clusters = list(rep_df['cluster'].head(3))
-    fig, axes = plt.subplots(3, 2, figsize=(12, 10))
     strategies = ['S1_center', 'S2_uniform']
-    for ci, c in enumerate(core_clusters):
-        for si, s in enumerate(strategies):
-            ax = axes[ci, si]
-            fmap = flux_maps[(c, s)]
-            im = ax.imshow(fmap, aspect='auto', origin='lower', cmap='hot',
-                          extent=[-cfg.mirror_length/2, cfg.mirror_length/2, -180, 180])
-            ax.set_xlabel('z (m)'); ax.set_ylabel('φ (deg)')
-            ax.set_title(f"{s} - C{c}")
-            plt.colorbar(im, ax=ax, label='Flux (W/m²)')
-    plt.suptitle('Fig. 3 基线策略吸热管表面能流分布')
-    plt.tight_layout()
-    plt.savefig(fig_dir / 'fig03_baseline_flux_maps.png')
-    plt.close()
+    def draw_fig03(lang):
+        fig, axes = plt.subplots(3, 2, figsize=(12, 10))
+        for ci, c in enumerate(core_clusters):
+            for si, s in enumerate(strategies):
+                ax = axes[ci, si]
+                fmap = flux_maps[(c, s)]
+                im = ax.imshow(fmap, aspect='auto', origin='lower', cmap='hot',
+                               extent=[-cfg.mirror_length/2, cfg.mirror_length/2, -180, 180])
+                ax.set_xlabel('轴向 z (m)' if lang == 'zh' else 'z (m)')
+                ax.set_ylabel('圆周角 φ (deg)' if lang == 'zh' else 'φ (deg)')
+                ax.set_title(f"{s} - {'簇' if lang == 'zh' else 'C'}{c}")
+                fig.colorbar(im, ax=ax, label='能流 (W/m²)' if lang == 'zh' else 'Flux (W/m²)')
+        fig.suptitle('图3 基线策略吸热管表面能流分布' if lang == 'zh' else 'Fig. 3 Flux maps on absorber surface for baseline strategies')
+        return fig
+    save_bilingual_figure(fig_dir / 'fig03_baseline_flux_maps.png', draw_fig03)
     
     # === 图 4: 圆周能流曲线 ===
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
     phi_axis = np.linspace(-180, 180, cfg.n_phi_bins)
-    for ci, c in enumerate(core_clusters):
-        ax = axes[ci]
-        for s in strategies:
-            fmap = flux_maps[(c, s)]
-            curve = fmap.mean(axis=1)
-            ax.plot(phi_axis, curve, label=s)
-        ax.set_xlabel('Circumferential angle φ (deg)')
-        ax.set_ylabel('Mean flux (W/m²)')
-        ax.set_title(f'C{c}')
-        ax.legend()
-    plt.suptitle('Fig. 4 圆周能流曲线对比')
-    plt.tight_layout()
-    plt.savefig(fig_dir / 'fig04_circumferential_curves.png')
-    plt.close()
+    def draw_fig04(lang):
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+        for ci, c in enumerate(core_clusters):
+            ax = axes[ci]
+            for s in strategies:
+                fmap = flux_maps[(c, s)]
+                curve = fmap.mean(axis=1)
+                ax.plot(phi_axis, curve, label=s)
+            ax.set_xlabel('圆周角 φ (deg)' if lang == 'zh' else 'Circumferential angle φ (deg)')
+            ax.set_ylabel('平均能流 (W/m²)' if lang == 'zh' else 'Mean flux (W/m²)')
+            ax.set_title(f"{'簇' if lang == 'zh' else 'C'}{c}")
+            ax.legend()
+        fig.suptitle('图4 圆周能流曲线对比' if lang == 'zh' else 'Fig. 4 Circumferential flux curves')
+        return fig
+    save_bilingual_figure(fig_dir / 'fig04_circumferential_curves.png', draw_fig04)
     
     # === 表 2: 基线汇总 ===
     base_df = baselines['results']
@@ -1885,46 +1955,47 @@ def export_figures_and_tables(cfg: Config, df: pd.DataFrame, cluster_data: dict,
     pivot.to_csv(tab_dir / 'tab02_baseline.csv')
     
     # === 图 5: Pareto 前沿 ===
-    fig, axes = plt.subplots(2, 3, figsize=(15, 9))
     pareto_data = bo_data['pareto_data']
-    for i, c in enumerate(list(pareto_data.keys())[:6]):
-        ax = axes[i // 3, i % 3]
-        for run in pareto_data[c]:
-            Y = run['Y']
-            mask = run['pareto_mask']
-            ax.scatter(Y[:, 1], Y[:, 0], s=10, alpha=0.3, c='gray')
-            ax.scatter(Y[mask, 1], Y[mask, 0], s=30, c='red', label='Pareto')
-        # 叠加基线点
-        b1 = base_df[(base_df['cluster']==c)&(base_df['strategy']=='S1_center')]
-        b2 = base_df[(base_df['cluster']==c)&(base_df['strategy']=='S2_uniform')]
-        if len(b1):
-            ax.scatter(b1['cv_circ'], b1['eta_opt'], marker='*', s=200, c='blue', label='S1')
-        if len(b2):
-            ax.scatter(b2['cv_circ'], b2['eta_opt'], marker='*', s=200, c='green', label='S2')
-        ax.set_xlabel('CV_circ (lower better)')
-        ax.set_ylabel('η_opt (higher better)')
-        ax.set_title(f'C{c}')
-        ax.legend(fontsize=8)
-    plt.suptitle('Fig. 5 BO Pareto 前沿(6 个代表时刻)')
-    plt.tight_layout()
-    plt.savefig(fig_dir / 'fig05_pareto_fronts.png')
-    plt.close()
+    def draw_fig05(lang):
+        fig, axes = plt.subplots(2, 3, figsize=(15, 9))
+        for i, c in enumerate(list(pareto_data.keys())[:6]):
+            ax = axes[i // 3, i % 3]
+            for run in pareto_data[c]:
+                Y = run['Y']
+                mask = run['pareto_mask']
+                ax.scatter(Y[:, 1], Y[:, 0], s=10, alpha=0.3, c='gray')
+                ax.scatter(Y[mask, 1], Y[mask, 0], s=30, c='red', label='Pareto')
+            b1 = base_df[(base_df['cluster']==c)&(base_df['strategy']=='S1_center')]
+            b2 = base_df[(base_df['cluster']==c)&(base_df['strategy']=='S2_uniform')]
+            if len(b1):
+                ax.scatter(b1['cv_circ'], b1['eta_opt'], marker='*', s=200, c='blue', label='S1')
+            if len(b2):
+                ax.scatter(b2['cv_circ'], b2['eta_opt'], marker='*', s=200, c='green', label='S2')
+            ax.set_xlabel('CV_circ（越小越好）' if lang == 'zh' else 'CV_circ (lower better)')
+            ax.set_ylabel('η_opt（越大越好）' if lang == 'zh' else 'η_opt (higher better)')
+            ax.set_title(f"{'簇' if lang == 'zh' else 'C'}{c}")
+            ax.legend(fontsize=8)
+        fig.suptitle('图5 BO Pareto 前沿（6个代表时刻）' if lang == 'zh' else 'Fig. 5 BO Pareto fronts (6 representative instants)')
+        return fig
+    save_bilingual_figure(fig_dir / 'fig05_pareto_fronts.png', draw_fig05)
     
     # === 图 6: 训练曲线 ===
     if history:
-        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
         ep = list(range(1, len(history['train_loss']) + 1))
-        axes[0].plot(ep, history['train_loss'], label='train')
-        axes[0].plot(ep, history['val_loss'], label='val')
-        axes[0].set_xlabel('Epoch'); axes[0].set_ylabel('MSE'); axes[0].legend()
-        axes[0].set_title('Training & Validation Loss')
-        axes[1].plot(ep, history['val_mae'])
-        axes[1].set_xlabel('Epoch'); axes[1].set_ylabel('Val MAE (m)')
-        axes[1].set_title('Validation MAE')
-        plt.suptitle('Fig. 7 Transformer 训练曲线')
-        plt.tight_layout()
-        plt.savefig(fig_dir / 'fig07_training_curves.png')
-        plt.close()
+        def draw_fig07(lang):
+            fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+            axes[0].plot(ep, history['train_loss'], label='train')
+            axes[0].plot(ep, history['val_loss'], label='val')
+            axes[0].set_xlabel('轮次' if lang == 'zh' else 'Epoch')
+            axes[0].set_ylabel('MSE'); axes[0].legend()
+            axes[0].set_title('训练与验证损失' if lang == 'zh' else 'Training & Validation Loss')
+            axes[1].plot(ep, history['val_mae'])
+            axes[1].set_xlabel('轮次' if lang == 'zh' else 'Epoch')
+            axes[1].set_ylabel('验证 MAE (m)' if lang == 'zh' else 'Val MAE (m)')
+            axes[1].set_title('验证 MAE' if lang == 'zh' else 'Validation MAE')
+            fig.suptitle('图7 Transformer 训练曲线' if lang == 'zh' else 'Fig. 7 Transformer training curves')
+            return fig
+        save_bilingual_figure(fig_dir / 'fig07_training_curves.png', draw_fig07)
     
     # === 表 5: 符号公式 ===
     if formulas:
@@ -1938,23 +2009,23 @@ def export_figures_and_tables(cfg: Config, df: pd.DataFrame, cluster_data: dict,
     # === 图 12 + 表 6: 年度策略对比 ===
     if annual:
         adf = annual['annual_summary']
-        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-        axes[0].bar(adf['strategy'], adf['annual_eta_opt'], color='steelblue')
-        axes[0].set_ylabel('Annual η_opt')
-        axes[0].set_title('年度光学效率对比')
-        for i, v in enumerate(adf['annual_eta_opt']):
-            axes[0].text(i, v + 0.005, f'{v:.3f}', ha='center')
-        axes[1].bar(adf['strategy'], adf['annual_cv_circ'], color='salmon')
-        axes[1].set_ylabel('Annual CV_circ')
-        axes[1].set_title('年度圆周变异系数')
-        for i, v in enumerate(adf['annual_cv_circ']):
-            axes[1].text(i, v + 0.01, f'{v:.3f}', ha='center')
-        for ax in axes:
-            ax.tick_params(axis='x', rotation=20)
-        plt.suptitle('Fig. 12 年度策略对比')
-        plt.tight_layout()
-        plt.savefig(fig_dir / 'fig12_annual_comparison.png')
-        plt.close()
+        def draw_fig12(lang):
+            fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+            axes[0].bar(adf['strategy'], adf['annual_eta_opt'], color='steelblue')
+            axes[0].set_ylabel('年度 η_opt' if lang == 'zh' else 'Annual η_opt')
+            axes[0].set_title('年度光学效率对比' if lang == 'zh' else 'Annual optical efficiency')
+            for i, v in enumerate(adf['annual_eta_opt']):
+                axes[0].text(i, v + 0.005, f'{v:.3f}', ha='center')
+            axes[1].bar(adf['strategy'], adf['annual_cv_circ'], color='salmon')
+            axes[1].set_ylabel('年度 CV_circ' if lang == 'zh' else 'Annual CV_circ')
+            axes[1].set_title('年度圆周变异系数' if lang == 'zh' else 'Annual circumferential CV')
+            for i, v in enumerate(adf['annual_cv_circ']):
+                axes[1].text(i, v + 0.01, f'{v:.3f}', ha='center')
+            for ax in axes:
+                ax.tick_params(axis='x', rotation=20)
+            fig.suptitle('图12 年度策略对比' if lang == 'zh' else 'Fig. 12 Annual strategy comparison')
+            return fig
+        save_bilingual_figure(fig_dir / 'fig12_annual_comparison.png', draw_fig12)
         
         adf.to_csv(tab_dir / 'tab06_annual.csv', index=False)
         adf.to_markdown(tab_dir / 'tab06_annual.md', index=False)
@@ -1967,17 +2038,21 @@ def export_figures_and_tables(cfg: Config, df: pd.DataFrame, cluster_data: dict,
     samples_df['hr'] = samples_df['ts'].dt.hour
     pivot_eta = samples_df.pivot_table(index='month', columns='hr', values='eta_opt', aggfunc='mean')
     pivot_cv = samples_df.pivot_table(index='month', columns='hr', values='cv_circ', aggfunc='mean')
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    im0 = axes[0].imshow(pivot_eta, aspect='auto', cmap='viridis', origin='lower')
-    axes[0].set_xlabel('Hour'); axes[0].set_ylabel('Month'); axes[0].set_title('η_opt')
-    plt.colorbar(im0, ax=axes[0])
-    im1 = axes[1].imshow(pivot_cv, aspect='auto', cmap='magma_r', origin='lower')
-    axes[1].set_xlabel('Hour'); axes[1].set_ylabel('Month'); axes[1].set_title('CV_circ')
-    plt.colorbar(im1, ax=axes[1])
-    plt.suptitle('Fig. 11 年度性能热力图(BO 优化策略)')
-    plt.tight_layout()
-    plt.savefig(fig_dir / 'fig11_annual_heatmap.png')
-    plt.close()
+    def draw_fig11(lang):
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        im0 = axes[0].imshow(pivot_eta, aspect='auto', cmap='viridis', origin='lower')
+        axes[0].set_xlabel('小时' if lang == 'zh' else 'Hour')
+        axes[0].set_ylabel('月份' if lang == 'zh' else 'Month')
+        axes[0].set_title('η_opt')
+        fig.colorbar(im0, ax=axes[0])
+        im1 = axes[1].imshow(pivot_cv, aspect='auto', cmap='magma_r', origin='lower')
+        axes[1].set_xlabel('小时' if lang == 'zh' else 'Hour')
+        axes[1].set_ylabel('月份' if lang == 'zh' else 'Month')
+        axes[1].set_title('CV_circ')
+        fig.colorbar(im1, ax=axes[1])
+        fig.suptitle('图11 年度性能热力图（BO优化策略）' if lang == 'zh' else 'Fig. 11 Annual performance heatmaps (BO strategy)')
+        return fig
+    save_bilingual_figure(fig_dir / 'fig11_annual_heatmap.png', draw_fig11)
     
     # === 给 Tonatiuh 的瞄准向量导出 ===
     export_aim_for_tonatiuh(cfg, cluster_data, bo_data, formulas, workdir)
