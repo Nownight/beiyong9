@@ -851,7 +851,8 @@ class MCRTTracer:
           - transverse_span 模式：每面镜横截面 x_aim，单位 m；
           - old_longitudinal 模式：旧版沿管轴偏移，单位 m。
         返回:
-          flux_map: [n_phi, n_z] 吸热管表面能流 (W/m²)
+          flux_map: [n_phi, n_z_bins] 吸热管表面能流 (W/m²)；
+              第二维 n_z_bins 为历史命名，实际表示管长方向 y 的离散位置。
           metrics: dict 含 eta_opt, cv_circ, sigma_surface, nuf, par, q_peak 等
         """
         if n_rays is None:
@@ -1043,7 +1044,8 @@ class MCRTTracer:
     def _cpc_trace(self, pos, direction, weight):
         """CPC 内光线追踪:多次反射直到命中吸热管或逃逸
         简化实现: 用解析法处理 CPC 壁(贝塞尔曲线近似为直线段集合)+ 吸热管(圆柱)
-        返回: (phi_hits, z_hits, weights) 命中吸热管的光线
+        返回: (phi_hits, z_hits, weights) 命中吸热管的光线；
+            z_hits 为历史变量名，实际保存 hit_pos[:, 1]，即管长方向 y 坐标。
         """
         pos = pos.copy()
         direction = direction.copy()
@@ -1102,7 +1104,7 @@ class MCRTTracer:
                 rel_x = hit_pos[:, 0] - absorber_x
                 rel_z = hit_pos[:, 2] - absorber_z
                 phi = np.arctan2(rel_z, rel_x)  # [-pi, pi]
-                z_pos_abs = hit_pos[:, 1]  # y 即沿管轴
+                z_pos_abs = hit_pos[:, 1]  # 历史变量名 z_hits，实际是管长方向 y 坐标
                 phi_hits.extend(phi.tolist())
                 z_hits.extend(z_pos_abs.tolist())
                 w_hits.extend(weight[idx].tolist())
@@ -1172,7 +1174,8 @@ class MCRTTracer:
     def _compute_metrics(self, flux_map):
         """从能流图计算均匀性指标
         
-        flux_map: [n_phi, n_z] 吸热管表面能流 (W/m²)
+        flux_map: [n_phi, n_z_bins] 吸热管表面能流 (W/m²)；
+            第二维 n_z_bins 为历史命名，实际表示管长方向 y 的离散位置。
             phi 方向: 0 ~ 2π, 索引 0 对应 phi=-π (吸热管顶部)
             按 trace() 中的映射: phi = arctan2(rel_z, rel_x)
             CPC 在管下方 → 辐照集中在管下半圆 (phi ∈ [-π, 0],对应索引 0~n_phi/2)
@@ -2292,8 +2295,14 @@ def expand_aim_to_full(aim, cfg):
 def compute_tonatiuh_mirror_pose(cfg, geo, mirror_id, sun_alt_deg, sun_az_deg, z_aim):
     """
     根据当前 Python 模型坐标系，计算 Tonatiuh 手动验证所需姿态参数。
+    仅支持旧 longitudinal z_aim 语义；transverse_span 模式下禁止调用。
     """
-    del cfg  # 接口保留 cfg 以便未来扩展
+    if getattr(cfg, 'aim_mode', None) == 'transverse_span':
+        raise NotImplementedError(
+            "compute_tonatiuh_mirror_pose() 当前只支持旧 longitudinal z_aim 语义；"
+            "transverse_span 模式下目标点应为 target_point=(x_aim, 0, receiver_height)，"
+            "本函数不得直接用于 transverse_span。"
+        )
     if mirror_id < 0 or mirror_id >= len(geo.mirror_x):
         raise ValueError(f"mirror_id 越界: {mirror_id}, n_mirrors={len(geo.mirror_x)}")
 
@@ -2423,7 +2432,7 @@ def export_figures_and_tables(cfg: Config, df: pd.DataFrame, cluster_data: dict,
                     continue
                 im = ax.imshow(fmap, aspect='auto', origin='lower', cmap='hot',
                                extent=[-cfg.mirror_length/2, cfg.mirror_length/2, -180, 180])
-                ax.set_xlabel('轴向 z (m)' if lang == 'zh' else 'z (m)')
+                ax.set_xlabel('管长方向 y (m)' if lang == 'zh' else 'Axial position y (m)')
                 ax.set_ylabel('圆周角 φ (deg)' if lang == 'zh' else 'φ (deg)')
                 ax.set_title(f"{s} - {'簇' if lang == 'zh' else 'C'}{c}")
                 fig.colorbar(im, ax=ax, label='能流 (W/m²)' if lang == 'zh' else 'Flux (W/m²)')
@@ -2612,10 +2621,18 @@ def export_tonatiuh_all_training_cases(cfg, cluster_data, bo_data, formulas, wor
         with open(readme_path, 'w', encoding='utf-8') as f:
             f.write(
                 "# Tonatiuh export skipped\n\n"
-                "当前 aim_mode='transverse_span'，优化变量为横截面 x_aim/span，"
-                "旧版 Tonatiuh 导出函数仍按 longitudinal z_aim 解释，容易产生错误语义。\n\n"
-                "本次实验先不使用 Tonatiuh 导出。如需后续导出，应改为 "
-                "target_point=(x_aim, 0, receiver_height)。\n"
+                "当前 aim_mode='transverse_span'。\n"
+                "优化变量为 span，实际每面镜横截面瞄准点为：\n"
+                "    x_aim_i = span * pattern_i\n\n"
+                "Python 坐标系：\n"
+                "    x = 横截面左右方向\n"
+                "    y = 管长方向\n"
+                "    z = 高度方向\n\n"
+                "旧 Tonatiuh 导出函数按 longitudinal z_aim 解释，会把 aim 当作管长方向偏移，"
+                "因此已跳过。\n"
+                "若后续需要 Tonatiuh 导出，应重新实现 "
+                "target_point=(x_aim_i, 0, receiver_height)，"
+                "其中 0 表示管长方向中心 y=0。\n"
             )
         return
 
