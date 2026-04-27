@@ -176,8 +176,14 @@ class Config:
     soiling: float = 0.97
     
     # 瞄准
-    aim_mode: str = 'longitudinal'  # longitudinal: 沿管轴 z_i
-    z_range: tuple = (-5.0, 5.0)
+    aim_mode: str = 'transverse_span'  # transverse_span: BO 只优化横截面分散半宽 span
+    # old_longitudinal: 旧版沿管轴偏移，仅保留兼容，不作为默认
+    z_range: tuple = (-5.0, 5.0)          # 旧版 longitudinal 参数保留，不再默认使用
+    xaim_span_range: tuple = (0.0, 0.04)  # BO 搜索 span，单位 m
+    paper_xaim_span: float = 0.035        # 文献策略4参考值，仅用于 BO 初始点/诊断
+    bo_uniformity_metric: str = 'sigma_surface'
+    bo_eta_floor_rel: float = 0.96
+    bo_force_paper_span_initial: bool = True
     use_symmetry: bool = True
     
     # 数据过滤
@@ -200,10 +206,8 @@ class Config:
     # BO
     bo_n_initial: int = 30
     bo_n_iterations: int = 80
-    bo_ref_point: tuple = (0.30, -1.5)  # (eta_opt 最低, -CV 最高)
-    # BO label guard
+    bo_ref_point: tuple = (0.30, -1.5)  # (eta_opt 最低, -uniformity 最高)
     bo_force_s1_initial: bool = True
-    bo_eta_floor_rel: float = 0.98
     
     # Transformer
     nn_d_model: int = 128
@@ -843,11 +847,12 @@ class MCRTTracer:
     
     def trace(self, sun_alt_deg, sun_az_deg, aim_z, dni, n_rays=None):
         """主追踪入口
-        aim_z: shape [N_mirrors] 每面镜沿管轴的瞄准偏移 (m)
+        aim_z / aim_vec:
+          - transverse_span 模式：每面镜横截面 x_aim，单位 m；
+          - old_longitudinal 模式：旧版沿管轴偏移，单位 m。
         返回:
           flux_map: [n_phi, n_z] 吸热管表面能流 (W/m²)
-          eta_opt: 光学效率
-          metrics: dict 含 cv_circ, nuf, par, q_peak 等
+          metrics: dict 含 eta_opt, cv_circ, sigma_surface, nuf, par, q_peak 等
         """
         if n_rays is None:
             n_rays = self.cfg.n_rays_eval
@@ -890,9 +895,17 @@ class MCRTTracer:
             if iam_array[i] < 1e-6:
                 continue  # 整面镜都被遮蔽,跳过
             
-            # 该镜的法向量(指向 CPC 入口)
-            target_x = -mx
-            target_z = self.geo.cpc_y
+            # 该镜的法向量
+            aim_vec = np.asarray(aim_z, dtype=float).ravel()
+            if self.cfg.aim_mode == 'transverse_span':
+                # 新版：光斑打在集热管横截面的不同 x 位置
+                x_aim_i = float(aim_vec[i])
+                target_x = x_aim_i - mx
+                target_z = self.geo.H
+            else:
+                # 旧版兼容：瞄准 CPC 入口中心
+                target_x = -mx
+                target_z = self.geo.cpc_y
             tlen = np.sqrt(target_x**2 + target_z**2)
             tx_n, tz_n = target_x / tlen, target_z / tlen
             # 入射的横纵投影
@@ -955,14 +968,19 @@ class MCRTTracer:
             rlen = np.sqrt(ref_x_arr**2 + ref_y_arr**2 + ref_z_arr**2)
             ref_x_arr /= rlen; ref_y_arr /= rlen; ref_z_arr /= rlen
             
-            # 应用瞄准偏移(纵向): 调整反射光线 y 分量
-            # 物理含义: 让光线打到 CPC 入口的 y 坐标 = ray_y0 + aim_z[i]
-            # (默认 aim_z=0 时,光线打到 y = ray_y0,即沿管轴均匀分布)
-            aim_offset_y = aim_z[i]
-            t_to_cpc = (self.geo.cpc_y - 0) / np.maximum(ref_z_arr, 1e-6)
-            # 目标: 光线在 z=cpc_y 平面的 y 落点 = ray_y0 + aim_offset_y
-            target_y = ray_y0 + aim_offset_y
-            ref_y_arr = (target_y - ray_y0) / np.maximum(t_to_cpc, 1e-6)
+            # 应用瞄准偏移，调整反射光线方向
+            if self.cfg.aim_mode == 'transverse_span':
+                # 新版：不做管长方向偏移，管长方向保持原 ray_y0（轴向偏移为 0）
+                target_y = ray_y0
+                target_plane_z = self.geo.H
+            else:
+                # 旧版兼容：沿管轴方向移动
+                aim_offset_y = float(aim_vec[i])
+                target_y = ray_y0 + aim_offset_y
+                target_plane_z = self.geo.cpc_y
+
+            t_to_target = (target_plane_z - ray_z0) / np.maximum(ref_z_arr, 1e-6)
+            ref_y_arr = (target_y - ray_y0) / np.maximum(t_to_target, 1e-6)
             rlen = np.sqrt(ref_x_arr**2 + ref_y_arr**2 + ref_z_arr**2)
             ref_x_arr /= rlen; ref_y_arr /= rlen; ref_z_arr /= rlen
             
@@ -1175,68 +1193,84 @@ class MCRTTracer:
         q_mean_full = flux_map.mean()
         if q_mean_full < 1e-9:
             return {'cv_global': 0, 'cv_circ': 0, 'cv_full': 0,
-                    'nuf': 0, 'par': 0, 'q_peak': 0, 'q_mean_irr': 0}
-        
+                    'nuf': 0, 'par': 0, 'q_peak': 0, 'q_mean_irr': 0,
+                    'sigma_surface': 0, 'par_full': 0,
+                    'top_flux_ratio': 0, 'top_to_bottom_ratio': 0, 'q_mean_full': 0}
+
         # 全圆周 CV(供参考)
         cv_full = flux_map.std() / q_mean_full
         # 全局 CV
         cv_global = cv_full
-        
+
         # 辐照半圆指标
         q_mean_irr = irradiated.mean()
         if q_mean_irr < 1e-9:
             return {'cv_global': float(cv_global), 'cv_circ': 0, 'cv_full': float(cv_full),
-                    'nuf': 0, 'par': 0, 'q_peak': float(flux_map.max()), 'q_mean_irr': 0}
-        
+                    'nuf': 0, 'par': 0, 'q_peak': float(flux_map.max()), 'q_mean_irr': 0,
+                    'sigma_surface': float(cv_full), 'par_full': float(flux_map.max() / (q_mean_full + 1e-9)),
+                    'top_flux_ratio': 0, 'top_to_bottom_ratio': 0, 'q_mean_full': float(q_mean_full)}
+
         # 圆周方向 CV: 只在辐照半圆上,对每个 z 切片
         cv_per_z = irradiated.std(axis=0) / (irradiated.mean(axis=0) + 1e-9)
         valid_z = irradiated.mean(axis=0) > q_mean_irr * 0.1
         cv_circ = cv_per_z[valid_z].mean() if valid_z.sum() > 0 else cv_per_z.mean()
-        
+
         # NUF (非均匀因子) — 辐照半圆
         nuf = np.abs(irradiated - q_mean_irr).sum() / (irradiated.size * q_mean_irr)
         # 峰均比
         par = irradiated.max() / q_mean_irr
         # 峰值能流(便于热应力评估)
         q_peak = float(flux_map.max())
-        
+
+        # 新增：全表面均匀性指标（论文口径）
+        sigma_surface = flux_map.std() / (q_mean_full + 1e-9)
+        par_full = flux_map.max() / (q_mean_full + 1e-9)
+
+        # 顶部/底部能流比
+        top_region = flux_map[n_phi // 2:, :]
+        bottom_region = flux_map[:n_phi // 2, :]
+        top_flux_mean = top_region.mean()
+        bottom_flux_mean = bottom_region.mean()
+        top_flux_ratio = top_flux_mean / (q_mean_full + 1e-9)
+        top_to_bottom_ratio = top_flux_mean / (bottom_flux_mean + 1e-9)
+
         return {'cv_global': float(cv_global),
                 'cv_circ': float(cv_circ),
                 'cv_full': float(cv_full),
                 'nuf': float(nuf),
                 'par': float(par),
                 'q_peak': q_peak,
-                'q_mean_irr': float(q_mean_irr)}
+                'q_mean_irr': float(q_mean_irr),
+                'sigma_surface': float(sigma_surface),
+                'par_full': float(par_full),
+                'top_flux_ratio': float(top_flux_ratio),
+                'top_to_bottom_ratio': float(top_to_bottom_ratio),
+                'q_mean_full': float(q_mean_full)}
 
 
 # ==================== 5. 基线策略 ====================
 
 def stage_baseline(cfg: Config, cluster_data: dict, logger: Logger,
                    stop: StopSignal, ckpt: Checkpoint):
-    """阶段 3: 三种基线策略评估"""
+    """阶段 3: 基线策略评估（主基线为 S1_center）"""
     logger.info("=== 阶段 3/7: 基线策略评估 ===")
     workdir = Path(cfg.workdir)
     out_path = workdir / 'baselines.pkl'
-    
+
     if ckpt.is_done('baseline') and out_path.exists():
         logger.info("已完成,加载基线结果")
         with open(out_path, 'rb') as f:
             return pickle.load(f)
-    
+
     geo = LFRGeometry(cfg)
     mcrt = MCRTTracer(cfg, geo)
-    
+
     rep_df = cluster_data['representatives']
     df = cluster_data['df']
-    
-    # 三种基线
-    def aim_s1(N): return np.zeros(N)  # 全瞄管心
-    def aim_s2(N, L=cfg.mirror_length):  # 均匀分布
-        return np.linspace(-L*0.4, L*0.4, N)
-    def aim_s3(N): return np.zeros(N)  # NSGA-II 占位(用 BO 替代)
-    
-    strategies = {'S1_center': aim_s1, 'S2_uniform': aim_s2}
-    
+
+    # 主基线只保留 S1_center（横截面/纵向都是全瞄管心）
+    strategies = {'S1_center': lambda N: make_s1_aim(cfg)}
+
     results = []
     flux_maps = {}
     total_evals = len(rep_df) * len(strategies)
@@ -1253,8 +1287,13 @@ def stage_baseline(cfg: Config, cluster_data: dict, logger: Logger,
                 'strategy': sname,
                 'eta_opt': m['eta_opt'],
                 'cv_circ': m['cv_circ'],
+                'sigma_surface': m['sigma_surface'],
+                'par_full': m['par_full'],
+                'top_flux_ratio': m['top_flux_ratio'],
+                'top_to_bottom_ratio': m['top_to_bottom_ratio'],
                 'nuf': m['nuf'],
                 'par': m['par'],
+                'q_peak': m['q_peak'],
                 'cv_global': m['cv_global'],
                 'timestamp': rep['rep_timestamp'],
                 'dni': row['DNI'],
@@ -1264,13 +1303,17 @@ def stage_baseline(cfg: Config, cluster_data: dict, logger: Logger,
             flux_maps[(rep['cluster'], sname)] = flux
             done += 1
             logger.progress(done / total_evals, f"基线 {sname} 簇{rep['cluster']}")
-    
+
     res_df = pd.DataFrame(results)
     out = {'results': res_df, 'flux_maps': flux_maps}
     with open(out_path, 'wb') as f:
         pickle.dump(out, f)
     ckpt.mark_done('baseline')
-    logger.info(f"基线评估完成: 平均 S1 CV_circ={res_df[res_df.strategy=='S1_center']['cv_circ'].mean():.3f}")
+    s1 = res_df[res_df.strategy == 'S1_center']
+    logger.info(
+        f"基线评估完成: S1 平均 CV_circ={s1['cv_circ'].mean():.3f}, "
+        f"sigma_surface={s1['sigma_surface'].mean():.3f}"
+    )
     return out
 
 
@@ -1418,9 +1461,17 @@ class SimpleMOBO:
         return mask
 
 
-def select_bo_label_with_s1_guard(X, Y, pareto_mask, x_s1, eta_floor_rel=0.98):
+def select_bo_label_with_eta_floor(X, Y, pareto_mask, x_s1, eta_floor_rel=0.96):
     """
     从 BO 历史中选择最终训练标签。
+    Y[:, 0] = eta_opt（越大越好）
+    Y[:, 1] = uniformity_metric（越小越好）
+
+    1. 找 span=0 的 S1 评价结果；
+    2. 计算 eta_floor = eta_S1 * eta_floor_rel；
+    3. 在 Pareto 点中筛选 eta_opt >= eta_floor；
+    4. 在可行点中选择 uniformity_metric 最小的点；
+    5. 若没有可行点，回退到 span=0。
     """
     X = np.asarray(X, dtype=float)
     Y = np.asarray(Y, dtype=float)
@@ -1433,44 +1484,57 @@ def select_bo_label_with_s1_guard(X, Y, pareto_mask, x_s1, eta_floor_rel=0.98):
     feasible_idx = pareto_idx[Y[pareto_idx, 0] >= eta_floor]
     if len(feasible_idx) > 0:
         best_idx = feasible_idx[np.argmin(Y[feasible_idx, 1])]
-        reason = 'pareto_min_cv_eta_floor'
+        reason = 'pareto_min_sigma_eta_floor'
     else:
         best_idx = s1_idx
-        reason = 'fallback_s1_no_pareto_eta_floor'
+        reason = 'fallback_s1_no_feasible_sigma_eta_floor'
     return X[best_idx], Y[best_idx], reason, s1_y
+
+
+# 旧版别名，保持向后兼容
+select_bo_label_with_s1_guard = select_bo_label_with_eta_floor
 
 
 def stage_bo(cfg: Config, df: pd.DataFrame, cluster_data: dict,
              logger: Logger, stop: StopSignal, ckpt: Checkpoint):
-    """阶段 4: BO 在每簇代表时刻+采样时刻找 Pareto knee"""
+    """阶段 4: BO 在每簇代表时刻+采样时刻找 Pareto knee
+
+    transverse_span 模式下:
+      dim=1, 搜索 span ∈ xaim_span_range
+      每面镜 x_aim 由 make_xaim_from_span(cfg, span) 生成
+    """
     logger.info("=== 阶段 4/7: 多目标贝叶斯优化 ===")
     workdir = Path(cfg.workdir)
     out_path = workdir / 'bo_dataset.pkl'
-    
+
     if ckpt.is_done('bo') and out_path.exists():
         logger.info("已完成,加载 BO 数据集")
         with open(out_path, 'rb') as f:
             return pickle.load(f)
-    
+
     geo = LFRGeometry(cfg)
     mcrt = MCRTTracer(cfg, geo)
-    
+
     rep_df = cluster_data['representatives']
     df_full = cluster_data['df']
-    
+
     # 决策变量维度
-    dim = cfg.n_mirrors // 2 if cfg.use_symmetry else cfg.n_mirrors
-    bounds = [cfg.z_range] * dim
-    
+    if cfg.aim_mode == 'transverse_span':
+        dim = 1
+        bounds = [cfg.xaim_span_range]
+    else:
+        dim = cfg.n_mirrors // 2 if cfg.use_symmetry else cfg.n_mirrors
+        bounds = [cfg.z_range] * dim
+
+    logger.info(f"BO 决策变量维度: {dim}, aim_mode={cfg.aim_mode}")
+
     samples = []
-    pareto_data = {}  # cluster_id -> (X, Y, mask)
-    
-    # 已完成的 (cluster, sample_idx) 列表
+    pareto_data = {}
+
     done_pairs = set(tuple(p) for p in ckpt.get_partial('bo', 'done_pairs', []))
-    
+
     total = len(rep_df) * cfg.samples_per_cluster
-    
-    # 加载已有部分结果
+
     partial_path = workdir / 'bo_partial.pkl'
     if partial_path.exists():
         with open(partial_path, 'rb') as f:
@@ -1478,43 +1542,80 @@ def stage_bo(cfg: Config, df: pd.DataFrame, cluster_data: dict,
         samples = saved['samples']
         pareto_data = saved['pareto_data']
         logger.info(f"恢复 {len(samples)} 个已有样本")
-    
+
     for ci, rep in rep_df.iterrows():
         cluster_id = rep['cluster']
         cluster_hours = df_full[df_full['cluster'] == cluster_id]
         n_pick = min(cfg.samples_per_cluster, len(cluster_hours))
-        # 固定种子采样
         sampled = cluster_hours.sample(n_pick, random_state=cfg.seed + cluster_id)
-        
+
         for si, (_, hour_row) in enumerate(sampled.iterrows()):
             stop.check()
             pair = (int(cluster_id), int(si))
             if pair in done_pairs:
                 continue
-            
+
             # 定义 BO 评估函数
-            def eval_fn(x):
-                if cfg.use_symmetry:
-                    aim = np.concatenate([x[::-1], x])
+            uniformity_key = cfg.bo_uniformity_metric
+
+            def eval_fn(x, _hr=hour_row):
+                if cfg.aim_mode == 'transverse_span':
+                    span = float(np.asarray(x).ravel()[0])
+                    aim = make_xaim_from_span(cfg, span)
                 else:
-                    aim = x
-                _, m = mcrt.trace(hour_row['solar_alt'], hour_row['solar_az'],
-                                  aim, hour_row['DNI'], n_rays=cfg.n_rays_eval)
-                return m['eta_opt'], m['cv_circ']
-            
+                    if cfg.use_symmetry:
+                        aim = np.concatenate([x[::-1], x])
+                    else:
+                        aim = x
+                _, m = mcrt.trace(_hr['solar_alt'], _hr['solar_az'],
+                                  aim, _hr['DNI'], n_rays=cfg.n_rays_eval)
+                uniformity = m.get(uniformity_key, m.get('sigma_surface', m['cv_circ']))
+                return m['eta_opt'], uniformity
+
             bo = SimpleMOBO(dim, bounds, n_initial=cfg.bo_n_initial,
-                           n_iter=cfg.bo_n_iterations, seed=cfg.seed + ci * 100 + si)
-            x_s1 = np.zeros(dim)
-            initial_points = [x_s1] if cfg.bo_force_s1_initial else None
+                            n_iter=cfg.bo_n_iterations, seed=cfg.seed + ci * 100 + si)
+
+            # 初始点
+            if cfg.aim_mode == 'transverse_span':
+                x_s1 = np.array([0.0])
+                initial_points = []
+                if cfg.bo_force_s1_initial:
+                    initial_points.append([0.0])
+                if cfg.bo_force_paper_span_initial:
+                    initial_points.append([cfg.paper_xaim_span])
+                initial_points = initial_points if initial_points else None
+            else:
+                x_s1 = np.zeros(dim)
+                initial_points = [x_s1.tolist()] if cfg.bo_force_s1_initial else None
+
             X, Y, knee_x, knee_y, pmask = bo.optimize(
                 eval_fn,
                 stop_check=stop.check,
                 initial_points=initial_points,
             )
-            selected_x, selected_y, selected_reason, s1_y = select_bo_label_with_s1_guard(
+            selected_x, selected_y, selected_reason, s1_y = select_bo_label_with_eta_floor(
                 X, Y, pmask, x_s1, eta_floor_rel=cfg.bo_eta_floor_rel
             )
-            
+
+            # 获取完整 metrics（对 selected_x 再调用一次 trace）
+            if cfg.aim_mode == 'transverse_span':
+                sel_span = float(selected_x.ravel()[0])
+                sel_aim = make_xaim_from_span(cfg, sel_span)
+                s1_aim = make_xaim_from_span(cfg, 0.0)
+            else:
+                sel_span = float('nan')
+                sel_aim = expand_aim_to_full(selected_x, cfg)
+                s1_aim = np.zeros(cfg.n_mirrors)
+
+            _, selected_metrics = mcrt.trace(
+                hour_row['solar_alt'], hour_row['solar_az'],
+                sel_aim, hour_row['DNI'], n_rays=cfg.n_rays_eval
+            )
+            _, s1_metrics = mcrt.trace(
+                hour_row['solar_alt'], hour_row['solar_az'],
+                s1_aim, hour_row['DNI'], n_rays=cfg.n_rays_eval
+            )
+
             samples.append({
                 'cluster': int(cluster_id),
                 'sample_idx': int(si),
@@ -1522,11 +1623,22 @@ def stage_bo(cfg: Config, df: pd.DataFrame, cluster_data: dict,
                 'solar_az': float(hour_row['solar_az']),
                 'cos_inc': float(hour_row['cos_inc']),
                 'dni': float(hour_row['DNI']),
-                'aim_optimal': selected_x.tolist(),
+                'aim_optimal': selected_x.tolist(),  # 1D [span] in transverse_span mode
                 'eta_opt': float(selected_y[0]),
-                'cv_circ': float(selected_y[1]),
+                'cv_circ': float(selected_metrics['cv_circ']),
+                'aim_mode': cfg.aim_mode,
+                'span_optimal': sel_span,
+                'xaim_min': float(-sel_span) if cfg.aim_mode == 'transverse_span' else float('nan'),
+                'xaim_max': float(sel_span) if cfg.aim_mode == 'transverse_span' else float('nan'),
+                'uniformity_metric': uniformity_key,
+                'uniformity_obj': float(selected_y[1]),
+                'sigma_surface': float(selected_metrics['sigma_surface']),
+                'par_full': float(selected_metrics['par_full']),
+                'top_flux_ratio': float(selected_metrics['top_flux_ratio']),
+                'top_to_bottom_ratio': float(selected_metrics['top_to_bottom_ratio']),
                 'bo_selected_reason': selected_reason,
-                's1_eta_opt': float(s1_y[0]),
+                's1_eta_opt': float(s1_metrics['eta_opt']),
+                's1_sigma_surface': float(s1_metrics['sigma_surface']),
                 's1_cv_circ': float(s1_y[1]),
                 'eta_floor_rel': float(cfg.bo_eta_floor_rel),
                 'timestamp': str(hour_row['timestamp']),
@@ -1535,26 +1647,26 @@ def stage_bo(cfg: Config, df: pd.DataFrame, cluster_data: dict,
                 pareto_data[int(cluster_id)] = []
             pareto_data[int(cluster_id)].append({'X': X, 'Y': Y, 'pareto_mask': pmask})
             done_pairs.add(pair)
-            
-            # 中间保存
+
             with open(partial_path, 'wb') as f:
                 pickle.dump({'samples': samples, 'pareto_data': pareto_data}, f)
             ckpt.set_partial('bo', 'done_pairs', list(done_pairs))
-            
+
             cur = len(samples)
             logger.progress(
                 cur / total,
                 f"BO 簇{cluster_id} 样本{si+1}/{n_pick} "
-                f"(η={selected_y[0]:.3f}, CV={selected_y[1]:.3f}, {selected_reason})"
+                f"(η={selected_y[0]:.3f}, σ={float(selected_metrics['sigma_surface']):.3f}, "
+                f"span={sel_span:.4f}, {selected_reason})"
             )
-    
+
     out = {'samples': pd.DataFrame(samples), 'pareto_data': pareto_data, 'dim': dim}
     with open(out_path, 'wb') as f:
         pickle.dump(out, f)
     if partial_path.exists():
         partial_path.unlink()
     ckpt.mark_done('bo')
-    logger.info(f"BO 完成: 共 {len(samples)} 个 (state, aim_optimal) 样本")
+    logger.info(f"BO 完成: 共 {len(samples)} 个 (state, aim_optimal) 样本, dim={dim}")
     return out
 
 
@@ -1562,15 +1674,19 @@ def stage_bo(cfg: Config, df: pd.DataFrame, cluster_data: dict,
 
 if HAS_TORCH:
     class AimTransformer(nn.Module):
-        """将太阳状态映射到对称瞄准向量(9 维)"""
-        def __init__(self, n_mirrors_half, d_model=128, n_heads=4, n_layers=3, n_clusters=12):
+        """将太阳状态映射到瞄准向量（transverse_span 下为 1 维 span，旧版为 9 维）"""
+        def __init__(self, n_mirrors_half, d_model=128, n_heads=4, n_layers=3, n_clusters=12,
+                     output_low=-5.0, output_high=5.0, output_activation='tanh'):
             super().__init__()
             self.n_half = n_mirrors_half
             self.input_dim = 4  # solar_alt, solar_az, cos_inc, dni
+            self.output_low = output_low
+            self.output_high = output_high
+            self.output_activation = output_activation
             self.cluster_emb = nn.Embedding(n_clusters, d_model // 4)
             self.state_proj = nn.Linear(self.input_dim, d_model - d_model // 4)
             self.mirror_emb = nn.Embedding(n_mirrors_half, d_model)
-            
+
             encoder_layer = nn.TransformerEncoderLayer(
                 d_model=d_model, nhead=n_heads, dim_feedforward=d_model * 2,
                 batch_first=True, dropout=0.1)
@@ -1580,7 +1696,7 @@ if HAS_TORCH:
                 nn.GELU(),
                 nn.Linear(d_model // 2, 1),
             )
-        
+
         def forward(self, state, cluster_id):
             B = state.size(0)
             ce = self.cluster_emb(cluster_id)
@@ -1590,8 +1706,12 @@ if HAS_TORCH:
             me = self.mirror_emb(mirror_ids)
             x = me + x_state
             x = self.encoder(x)
-            z = self.head(x).squeeze(-1)
-            return torch.tanh(z) * 5.0  # [-5, 5] m
+            raw = self.head(x).squeeze(-1)
+            if self.output_activation == 'sigmoid':
+                return torch.sigmoid(raw) * (self.output_high - self.output_low) + self.output_low
+            else:
+                scale = max(abs(self.output_low), abs(self.output_high))
+                return torch.tanh(raw) * scale
 
 
 def stage_train(cfg: Config, bo_data: dict, logger: Logger,
@@ -1637,23 +1757,32 @@ def stage_train(cfg: Config, bo_data: dict, logger: Logger,
     Y = np.array(aims_raw, dtype=np.float32)
     if Y.ndim != 2:
         raise ValueError(f'aim_optimal 解析失败,Y.shape={Y.shape}, dim={dim}')
-    logger.info(f'训练集: {len(X)} 样本,维度 {Y.shape[1]}')
-    
+    logger.info(f'训练集: {len(X)} 样本, 输出维度 {Y.shape[1]}, aim_mode={cfg.aim_mode}')
+
     # 标准化输入
     X_mean = X.mean(0); X_std = X.std(0) + 1e-6
     X_norm = (X - X_mean) / X_std
-    
+
     # 划分
     n = len(X)
     rng = np.random.RandomState(cfg.seed)
     perm = rng.permutation(n)
     n_val = int(n * cfg.nn_val_ratio)
     val_idx = perm[:n_val]; train_idx = perm[n_val:]
-    
+
     device = cfg.get_device()
+    # 输出范围随 aim_mode 变化
+    if cfg.aim_mode == 'transverse_span':
+        output_low, output_high = cfg.xaim_span_range
+        output_activation = 'sigmoid'
+    else:
+        output_low, output_high = cfg.z_range
+        output_activation = 'tanh'
     model = AimTransformer(n_mirrors_half=dim, d_model=cfg.nn_d_model,
                            n_heads=cfg.nn_n_heads, n_layers=cfg.nn_n_layers,
-                           n_clusters=cfg.n_clusters).to(device)
+                           n_clusters=cfg.n_clusters,
+                           output_low=output_low, output_high=output_high,
+                           output_activation=output_activation).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.nn_lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.nn_epochs)
     loss_fn = nn.MSELoss()
@@ -1775,6 +1904,12 @@ def stage_distill(cfg: Config, bo_data: dict, train_path: Path,
     
     formulas = {}
     
+    def _formula_key(i, dim, aim_mode):
+        """在 transverse_span 模式下输出维度=1，命名为 span 而非 z_1"""
+        if aim_mode == 'transverse_span' and dim == 1 and i == 0:
+            return 'span'
+        return f'z_{i+1}'
+
     if not HAS_PYSR:
         logger.warn("PySR 未安装,使用多项式回归代替")
         from sklearn.preprocessing import PolynomialFeatures
@@ -1782,6 +1917,7 @@ def stage_distill(cfg: Config, bo_data: dict, train_path: Path,
         from sklearn.pipeline import Pipeline
         for i in range(dim):
             stop.check()
+            key = _formula_key(i, dim, cfg.aim_mode)
             pipe = Pipeline([
                 ('poly', PolynomialFeatures(degree=3, include_bias=False)),
                 ('reg', Ridge(alpha=1.0))
@@ -1790,18 +1926,19 @@ def stage_distill(cfg: Config, bo_data: dict, train_path: Path,
             pred = pipe.predict(X)
             r2 = 1 - ((Y[:, i] - pred)**2).sum() / ((Y[:, i] - Y[:, i].mean())**2).sum()
             mae = np.abs(Y[:, i] - pred).mean()
-            formulas[f'z_{i+1}'] = {
+            formulas[key] = {
                 'expression': '(polynomial degree-3, see model file)',
                 'r2': float(r2),
                 'mae': float(mae),
                 'model_type': 'polynomial',
             }
-            with open(workdir / f'poly_z_{i+1}.pkl', 'wb') as f:
+            with open(workdir / f'poly_{key}.pkl', 'wb') as f:
                 pickle.dump(pipe, f)
-            logger.progress((i + 1) / dim, f"多项式 z_{i+1}: R²={r2:.3f}")
+            logger.progress((i + 1) / dim, f"多项式 {key}: R²={r2:.3f}")
     else:
         for i in range(dim):
             stop.check()
+            key = _formula_key(i, dim, cfg.aim_mode)
             sr = PySRRegressor(
                 niterations=cfg.pysr_iterations,
                 population_size=cfg.pysr_population,
@@ -1816,14 +1953,14 @@ def stage_distill(cfg: Config, bo_data: dict, train_path: Path,
             best = sr.get_best()
             pred = sr.predict(X)
             r2 = 1 - ((Y[:, i] - pred)**2).sum() / ((Y[:, i] - Y[:, i].mean())**2).sum()
-            formulas[f'z_{i+1}'] = {
+            formulas[key] = {
                 'expression': str(best['equation']),
                 'complexity': int(best['complexity']),
                 'r2': float(r2),
                 'mae': float(np.abs(Y[:, i] - pred).mean()),
                 'model_type': 'symbolic',
             }
-            logger.progress((i + 1) / dim, f"PySR z_{i+1}: {formulas[f'z_{i+1}']['expression']}")
+            logger.progress((i + 1) / dim, f"PySR {key}: {formulas[key]['expression']}")
     
     with open(out_path, 'w') as f:
         json.dump(formulas, f, indent=2)
@@ -1837,91 +1974,120 @@ def stage_annual(cfg: Config, df: pd.DataFrame, cluster_data: dict,
                  bo_data: dict, train_path: Path, formulas: dict,
                  baselines: dict, logger: Logger, stop: StopSignal,
                  ckpt: Checkpoint):
-    """阶段 7: 年度性能合成,所有策略对比"""
+    """阶段 7: 年度性能合成
+
+    主对比策略:
+      S1_center         - 所有镜子瞄准管心
+      BO_adaptive_span  - BO 自适应横截面分散范围
+      NN_adaptive_span  - Transformer 预测 span (可选)
+    """
     logger.info("=== 阶段 7/7: 年度合成与对比 ===")
     workdir = Path(cfg.workdir)
     out_path = workdir / 'annual.pkl'
-    
+
     if ckpt.is_done('annual') and out_path.exists():
         with open(out_path, 'rb') as f:
             return pickle.load(f)
-    
-    # 加权年度: 用聚类权重 × 代表时刻性能
+
     rep_df = cluster_data['representatives']
     weights = rep_df.set_index('cluster')['weight'].to_dict()
-    
-    # 计算每策略的年度加权平均
     base_df = baselines['results']
-    
-    # NN 推理得到每个簇代表时刻的瞄准向量
+
     geo = LFRGeometry(cfg)
     mcrt = MCRTTracer(cfg, geo)
-    
+
     annual_records = []
     annual_detail_records = []
-    
-    # 基线 S1, S2
-    for sname in ['S1_center', 'S2_uniform']:
-        sub = base_df[base_df['strategy'] == sname]
-        eta_w = sum(weights[r['cluster']] * r['eta_opt'] for _, r in sub.iterrows())
-        cv_w = sum(weights[r['cluster']] * r['cv_circ'] for _, r in sub.iterrows())
+
+    def _weighted_metrics(records_for_strategy):
+        eta_total = 0.0; sigma_total = 0.0; cv_total = 0.0
+        par_total = 0.0; top_total = 0.0
+        for r in records_for_strategy:
+            w = r['weight']
+            eta_total += w * r['eta_opt']
+            sigma_total += w * r['sigma_surface']
+            cv_total += w * r['cv_circ']
+            par_total += w * r['par_full']
+            top_total += w * r['top_flux_ratio']
+        return eta_total, sigma_total, cv_total, par_total, top_total
+
+    # --- S1_center (from baselines or re-evaluate) ---
+    s1_sub = base_df[base_df['strategy'] == 'S1_center']
+    if len(s1_sub) > 0 and 'sigma_surface' in s1_sub.columns:
+        s1_recs = []
+        for _, r in s1_sub.iterrows():
+            s1_recs.append({
+                'cluster': r['cluster'],
+                'strategy': 'S1_center',
+                'eta_opt': r['eta_opt'],
+                'sigma_surface': r.get('sigma_surface', 0.0),
+                'cv_circ': r['cv_circ'],
+                'par_full': r.get('par_full', 0.0),
+                'top_flux_ratio': r.get('top_flux_ratio', 0.0),
+                'span': 0.0,
+                'source_sample_idx': -1,
+                'distance_to_rep': 0.0,
+                'weight': weights[r['cluster']],
+            })
+        eta_s1, sig_s1, cv_s1, par_s1, top_s1 = _weighted_metrics(s1_recs)
         annual_records.append({
-            'strategy': sname,
-            'annual_eta_opt': eta_w,
-            'annual_cv_circ': cv_w,
+            'strategy': 'S1_center',
+            'annual_eta_opt': eta_s1,
+            'annual_sigma_surface': sig_s1,
+            'annual_cv_circ': cv_s1,
+            'annual_par_full': par_s1,
+            'annual_top_flux_ratio': top_s1,
         })
-    
-    # NN 策略
-    if HAS_TORCH and train_path.exists():
-        device = cfg.get_device()
-        dim = bo_data['dim']
-        model = AimTransformer(n_mirrors_half=dim, d_model=cfg.nn_d_model,
-                               n_heads=cfg.nn_n_heads, n_layers=cfg.nn_n_layers,
-                               n_clusters=cfg.n_clusters).to(device)
-        model.load_state_dict(torch.load(train_path, map_location=device))
-        model.eval()
-        
-        norm = np.load(workdir / 'norm.npz')
-        X_mean, X_std = norm['X_mean'], norm['X_std']
-        
-        eta_total = 0; cv_total = 0
+        annual_detail_records.extend(s1_recs)
+    else:
+        # Re-evaluate S1
+        s1_recs = []
         for _, rep in rep_df.iterrows():
+            stop.check()
             cluster_id = rep['cluster']
             row = cluster_data['df'].iloc[rep['rep_idx']]
-            x_in = (np.array([[row['solar_alt'], row['solar_az'],
-                              row['cos_inc'], row['DNI']]]) - X_mean) / X_std
-            with torch.no_grad():
-                aim_half = model(
-                    torch.from_numpy(x_in.astype(np.float32)).to(device),
-                    torch.tensor([cluster_id], dtype=torch.long).to(device)
-                ).cpu().numpy()[0]
-            aim = expand_aim_to_full(aim_half, cfg)
+            aim = make_s1_aim(cfg)
             _, m = mcrt.trace(row['solar_alt'], row['solar_az'], aim, row['DNI'],
-                             n_rays=cfg.n_rays_validate)
-            eta_total += weights[cluster_id] * m['eta_opt']
-            cv_total += weights[cluster_id] * m['cv_circ']
-            stop.check()
-        
+                              n_rays=cfg.n_rays_validate)
+            s1_recs.append({
+                'cluster': int(cluster_id),
+                'strategy': 'S1_center',
+                'eta_opt': float(m['eta_opt']),
+                'sigma_surface': float(m['sigma_surface']),
+                'cv_circ': float(m['cv_circ']),
+                'par_full': float(m['par_full']),
+                'top_flux_ratio': float(m['top_flux_ratio']),
+                'span': 0.0,
+                'source_sample_idx': -1,
+                'distance_to_rep': 0.0,
+                'weight': float(weights[cluster_id]),
+            })
+        eta_s1, sig_s1, cv_s1, par_s1, top_s1 = _weighted_metrics(s1_recs)
         annual_records.append({
-            'strategy': 'NN_Transformer',
-            'annual_eta_opt': eta_total,
-            'annual_cv_circ': cv_total,
+            'strategy': 'S1_center',
+            'annual_eta_opt': eta_s1,
+            'annual_sigma_surface': sig_s1,
+            'annual_cv_circ': cv_s1,
+            'annual_par_full': par_s1,
+            'annual_top_flux_ratio': top_s1,
         })
-    
-    # BO knee 策略: 在代表时刻做同口径验证
+        annual_detail_records.extend(s1_recs)
+
+    # --- BO_adaptive_span ---
     samples = bo_data['samples'].copy()
     dni_col = 'dni' if 'dni' in samples.columns else 'DNI'
-    eta_bo = 0.0
-    cv_bo = 0.0
+    bo_recs = []
     for _, rep in rep_df.iterrows():
+        stop.check()
         cluster_id = rep['cluster']
         row = cluster_data['df'].iloc[rep['rep_idx']]
         c_samples = samples[samples['cluster'] == cluster_id]
         if len(c_samples) == 0:
-            aim = np.zeros(cfg.n_mirrors)
+            aim = make_s1_aim(cfg)
             source_sample_idx = -1
             dist_min = float('nan')
             lookup_reason = 'fallback_s1_no_bo_sample'
+            used_span = 0.0
         else:
             sample_feats = c_samples[['solar_alt', 'solar_az', 'cos_inc', dni_col]].values.astype(float)
             target_feat = np.array([row['solar_alt'], row['solar_az'], row['cos_inc'], row['DNI']], dtype=float)
@@ -1933,27 +2099,97 @@ def stage_annual(cfg: Config, df: pd.DataFrame, cluster_data: dict,
             source_sample_idx = int(nearest['sample_idx'])
             dist_min = float(np.min(dist))
             lookup_reason = 'nearest_bo_sample_same_cluster'
+            used_span = float(nearest.get('span_optimal', float('nan')))
         _, m = mcrt.trace(row['solar_alt'], row['solar_az'], aim, row['DNI'],
-                         n_rays=cfg.n_rays_validate)
-        eta_bo += weights[cluster_id] * m['eta_opt']
-        cv_bo += weights[cluster_id] * m['cv_circ']
-        annual_detail_records.append({
+                          n_rays=cfg.n_rays_validate)
+        bo_recs.append({
             'cluster': int(cluster_id),
-            'strategy': 'BO_Knee',
+            'strategy': 'BO_adaptive_span',
             'eta_opt': float(m['eta_opt']),
+            'sigma_surface': float(m['sigma_surface']),
             'cv_circ': float(m['cv_circ']),
+            'par_full': float(m['par_full']),
+            'top_flux_ratio': float(m['top_flux_ratio']),
+            'span': used_span,
             'source_sample_idx': source_sample_idx,
             'distance_to_rep': dist_min,
-            'lookup_reason': lookup_reason,
             'weight': float(weights[cluster_id]),
         })
-        stop.check()
+    eta_bo, sig_bo, cv_bo, par_bo, top_bo = _weighted_metrics(bo_recs)
     annual_records.append({
-        'strategy': 'BO_Knee',
+        'strategy': 'BO_adaptive_span',
         'annual_eta_opt': eta_bo,
+        'annual_sigma_surface': sig_bo,
         'annual_cv_circ': cv_bo,
+        'annual_par_full': par_bo,
+        'annual_top_flux_ratio': top_bo,
     })
-    
+    annual_detail_records.extend(bo_recs)
+
+    # --- NN_adaptive_span (optional) ---
+    if HAS_TORCH and train_path is not None and Path(train_path).exists():
+        try:
+            device = cfg.get_device()
+            dim = bo_data['dim']
+            if cfg.aim_mode == 'transverse_span':
+                output_low, output_high = cfg.xaim_span_range
+                output_activation = 'sigmoid'
+            else:
+                output_low, output_high = cfg.z_range
+                output_activation = 'tanh'
+            model = AimTransformer(n_mirrors_half=dim, d_model=cfg.nn_d_model,
+                                   n_heads=cfg.nn_n_heads, n_layers=cfg.nn_n_layers,
+                                   n_clusters=cfg.n_clusters,
+                                   output_low=output_low, output_high=output_high,
+                                   output_activation=output_activation).to(device)
+            model.load_state_dict(torch.load(train_path, map_location=device))
+            model.eval()
+
+            norm = np.load(workdir / 'norm.npz')
+            X_mean, X_std = norm['X_mean'], norm['X_std']
+
+            nn_recs = []
+            for _, rep in rep_df.iterrows():
+                stop.check()
+                cluster_id = rep['cluster']
+                row = cluster_data['df'].iloc[rep['rep_idx']]
+                x_in = (np.array([[row['solar_alt'], row['solar_az'],
+                                   row['cos_inc'], row['DNI']]]) - X_mean) / X_std
+                with torch.no_grad():
+                    nn_out = model(
+                        torch.from_numpy(x_in.astype(np.float32)).to(device),
+                        torch.tensor([cluster_id], dtype=torch.long).to(device)
+                    ).cpu().numpy()[0]
+                aim = expand_aim_to_full(nn_out, cfg)
+                used_span = float(nn_out[0]) if cfg.aim_mode == 'transverse_span' else float('nan')
+                _, m = mcrt.trace(row['solar_alt'], row['solar_az'], aim, row['DNI'],
+                                  n_rays=cfg.n_rays_validate)
+                nn_recs.append({
+                    'cluster': int(cluster_id),
+                    'strategy': 'NN_adaptive_span',
+                    'eta_opt': float(m['eta_opt']),
+                    'sigma_surface': float(m['sigma_surface']),
+                    'cv_circ': float(m['cv_circ']),
+                    'par_full': float(m['par_full']),
+                    'top_flux_ratio': float(m['top_flux_ratio']),
+                    'span': used_span,
+                    'source_sample_idx': -1,
+                    'distance_to_rep': 0.0,
+                    'weight': float(weights[cluster_id]),
+                })
+            eta_nn, sig_nn, cv_nn, par_nn, top_nn = _weighted_metrics(nn_recs)
+            annual_records.append({
+                'strategy': 'NN_adaptive_span',
+                'annual_eta_opt': eta_nn,
+                'annual_sigma_surface': sig_nn,
+                'annual_cv_circ': cv_nn,
+                'annual_par_full': par_nn,
+                'annual_top_flux_ratio': top_nn,
+            })
+            annual_detail_records.extend(nn_recs)
+        except Exception as e:
+            logger.warn(f"NN 推理失败，跳过 NN_adaptive_span: {e}")
+
     annual_df = pd.DataFrame(annual_records)
     out = {
         'annual_summary': annual_df,
@@ -1963,10 +2199,14 @@ def stage_annual(cfg: Config, df: pd.DataFrame, cluster_data: dict,
     with open(out_path, 'wb') as f:
         pickle.dump(out, f)
     ckpt.mark_done('annual')
-    
+
     logger.info("年度对比:")
     for _, r in annual_df.iterrows():
-        logger.info(f"  {r['strategy']}: η={r['annual_eta_opt']:.3f} CV_circ={r['annual_cv_circ']:.3f}")
+        logger.info(
+            f"  {r['strategy']}: η={r['annual_eta_opt']:.3f} "
+            f"σ={r.get('annual_sigma_surface', float('nan')):.3f} "
+            f"CV_circ={r['annual_cv_circ']:.3f}"
+        )
     return out
 
 
@@ -1987,18 +2227,65 @@ def _safe_parse_aim_vector(raw_aim):
     return aim
 
 
+def make_xaim_pattern(cfg, n=None):
+    """
+    生成横截面瞄准点基础 pattern，范围 [-1, 1]。
+    pattern 顺序与 geo.mirror_x / mirror_id 顺序一致。
+    """
+    if n is None:
+        n = cfg.n_mirrors
+    return np.linspace(-1.0, 1.0, int(n), dtype=float)
+
+
+def make_xaim_from_span(cfg, span):
+    """
+    根据 BO 搜索到的 span 生成每面镜的横截面瞄准点 x_aim。
+
+    span = 0      -> 所有镜子瞄准管心
+    span = 0.035  -> 接近文献策略4
+    span = 0.04   -> 稍激进但仍在建议安全范围内
+    """
+    span = float(np.asarray(span).ravel()[0])
+    lo, hi = cfg.xaim_span_range
+    span = float(np.clip(span, lo, hi))
+    return span * make_xaim_pattern(cfg, cfg.n_mirrors)
+
+
+def make_s1_aim(cfg):
+    """
+    S1_center：所有镜子瞄准管子中心 (span=0)。
+    """
+    if cfg.aim_mode == 'transverse_span':
+        return make_xaim_from_span(cfg, 0.0)
+    return np.zeros(cfg.n_mirrors, dtype=float)
+
+
 def expand_aim_to_full(aim, cfg):
     """
     将策略输出的 aim 向量统一展开成 cfg.n_mirrors 维。
     """
     aim = np.asarray(aim, dtype=np.float64).ravel()
+
+    if cfg.aim_mode == 'transverse_span':
+        # aim 可能是 [span]，也可能已经是 full x_aim
+        if aim.size == 1:
+            return make_xaim_from_span(cfg, float(aim[0]))
+        if aim.size == cfg.n_mirrors:
+            return aim
+        raise ValueError(
+            f"transverse_span 模式下 aim 应为 1 维 span 或 {cfg.n_mirrors} 维 full x_aim，"
+            f"当前 len={aim.size}"
+        )
+
+    # 旧版兼容：longitudinal 半场或全场
     if aim.size == cfg.n_mirrors:
         return aim
     if cfg.n_mirrors % 2 == 0 and aim.size == cfg.n_mirrors // 2:
         return np.concatenate([aim[::-1], aim])
     raise ValueError(
         f"aim 向量维度不匹配: len(aim)={aim.size}, "
-        f"cfg.n_mirrors={cfg.n_mirrors}, cfg.use_symmetry={cfg.use_symmetry}"
+        f"cfg.n_mirrors={cfg.n_mirrors}, cfg.aim_mode={cfg.aim_mode}, "
+        f"cfg.use_symmetry={cfg.use_symmetry}"
     )
 
 
@@ -2121,13 +2408,19 @@ def export_figures_and_tables(cfg: Config, df: pd.DataFrame, cluster_data: dict,
     # === 图 3: 基线能流云图 ===
     flux_maps = baselines['flux_maps']
     core_clusters = list(rep_df['cluster'].head(3))
-    strategies = ['S1_center', 'S2_uniform']
+    _baseline_strategies = sorted({s for _, s in flux_maps.keys()})
     def draw_fig03(lang):
-        fig, axes = plt.subplots(3, 2, figsize=(12, 10))
+        ncols = max(len(_baseline_strategies), 1)
+        fig, axes = plt.subplots(3, ncols, figsize=(6 * ncols, 10))
+        if ncols == 1:
+            axes = axes[:, None]
         for ci, c in enumerate(core_clusters):
-            for si, s in enumerate(strategies):
+            for si, s in enumerate(_baseline_strategies):
                 ax = axes[ci, si]
-                fmap = flux_maps[(c, s)]
+                fmap = flux_maps.get((c, s))
+                if fmap is None:
+                    ax.axis('off')
+                    continue
                 im = ax.imshow(fmap, aspect='auto', origin='lower', cmap='hot',
                                extent=[-cfg.mirror_length/2, cfg.mirror_length/2, -180, 180])
                 ax.set_xlabel('轴向 z (m)' if lang == 'zh' else 'z (m)')
@@ -2144,8 +2437,10 @@ def export_figures_and_tables(cfg: Config, df: pd.DataFrame, cluster_data: dict,
         fig, axes = plt.subplots(1, 3, figsize=(15, 4))
         for ci, c in enumerate(core_clusters):
             ax = axes[ci]
-            for s in strategies:
-                fmap = flux_maps[(c, s)]
+            for s in _baseline_strategies:
+                fmap = flux_maps.get((c, s))
+                if fmap is None:
+                    continue
                 curve = fmap.mean(axis=1)
                 ax.plot(phi_axis, curve, label=s)
             ax.set_xlabel('圆周角 φ (deg)' if lang == 'zh' else 'Circumferential angle φ (deg)')
@@ -2158,23 +2453,28 @@ def export_figures_and_tables(cfg: Config, df: pd.DataFrame, cluster_data: dict,
     
     # === 表 2: 基线汇总 ===
     base_df = baselines['results']
-    pivot = base_df.pivot_table(index='cluster', columns='strategy',
-                                 values=['eta_opt', 'cv_circ', 'nuf', 'par'])
+    _pivot_vals = [v for v in ['eta_opt', 'cv_circ', 'sigma_surface', 'par_full',
+                                'top_flux_ratio', 'nuf', 'par'] if v in base_df.columns]
+    pivot = base_df.pivot_table(index='cluster', columns='strategy', values=_pivot_vals)
     pivot.to_csv(tab_dir / 'tab02_baseline.csv')
-    
+
     # === 表 3: BO 选择诊断 ===
     samples_diag = bo_data['samples']
-    required_diag_cols = {'bo_selected_reason', 's1_eta_opt', 's1_cv_circ'}
-    if required_diag_cols.issubset(set(samples_diag.columns)):
-        diag_cols = [
-            'cluster', 'sample_idx', 'timestamp', 'eta_opt', 'cv_circ',
-            's1_eta_opt', 's1_cv_circ', 'bo_selected_reason', 'eta_floor_rel'
-        ]
-        keep_cols = [c for c in diag_cols if c in samples_diag.columns]
+    diag_cols = [
+        'cluster', 'sample_idx', 'timestamp', 'eta_opt', 'cv_circ',
+        'sigma_surface', 'par_full', 'top_flux_ratio',
+        'span_optimal', 'xaim_min', 'xaim_max', 'aim_mode',
+        'uniformity_metric', 'uniformity_obj',
+        's1_eta_opt', 's1_sigma_surface', 's1_cv_circ',
+        'bo_selected_reason', 'eta_floor_rel'
+    ]
+    keep_cols = [c for c in diag_cols if c in samples_diag.columns]
+    if keep_cols:
         samples_diag[keep_cols].to_csv(tab_dir / 'tab03_bo_selection_diagnostics.csv', index=False)
     
     # === 图 5: Pareto 前沿 ===
     pareto_data = bo_data['pareto_data']
+    _sigma_col = 'sigma_surface' if 'sigma_surface' in (bo_data['samples'].columns if hasattr(bo_data['samples'], 'columns') else []) else 'cv_circ'
     def draw_fig05(lang):
         fig, axes = plt.subplots(2, 3, figsize=(15, 9))
         for i, c in enumerate(list(pareto_data.keys())[:6]):
@@ -2184,13 +2484,12 @@ def export_figures_and_tables(cfg: Config, df: pd.DataFrame, cluster_data: dict,
                 mask = run['pareto_mask']
                 ax.scatter(Y[:, 1], Y[:, 0], s=10, alpha=0.3, c='gray')
                 ax.scatter(Y[mask, 1], Y[mask, 0], s=30, c='red', label='Pareto')
-            b1 = base_df[(base_df['cluster']==c)&(base_df['strategy']=='S1_center')]
-            b2 = base_df[(base_df['cluster']==c)&(base_df['strategy']=='S2_uniform')]
-            if len(b1):
-                ax.scatter(b1['cv_circ'], b1['eta_opt'], marker='*', s=200, c='blue', label='S1')
-            if len(b2):
-                ax.scatter(b2['cv_circ'], b2['eta_opt'], marker='*', s=200, c='green', label='S2')
-            ax.set_xlabel('CV_circ（越小越好）' if lang == 'zh' else 'CV_circ (lower better)')
+            b1 = base_df[(base_df['cluster'] == c) & (base_df['strategy'] == 'S1_center')]
+            if len(b1) and _sigma_col in b1.columns:
+                ax.scatter(b1[_sigma_col], b1['eta_opt'], marker='*', s=200, c='blue', label='S1')
+            xlabel_zh = '表面能流标准差 σ（越小越好）' if _sigma_col == 'sigma_surface' else 'CV_circ（越小越好）'
+            xlabel_en = 'Surface flux std. σ (lower better)' if _sigma_col == 'sigma_surface' else 'CV_circ (lower better)'
+            ax.set_xlabel(xlabel_zh if lang == 'zh' else xlabel_en)
             ax.set_ylabel('η_opt（越大越好）' if lang == 'zh' else 'η_opt (higher better)')
             ax.set_title(f"{'簇' if lang == 'zh' else 'C'}{c}")
             ax.legend(fontsize=8)
@@ -2198,9 +2497,11 @@ def export_figures_and_tables(cfg: Config, df: pd.DataFrame, cluster_data: dict,
         return fig
     save_bilingual_figure(fig_dir / 'fig05_pareto_fronts.png', draw_fig05)
     
-    # === 图 6: 训练曲线 ===
+    # === 图 7: 训练曲线 ===
     if history:
         ep = list(range(1, len(history['train_loss']) + 1))
+        _mae_label_zh = 'span MAE (m)' if cfg.aim_mode == 'transverse_span' else '验证 MAE (m)'
+        _mae_label_en = 'span MAE (m)' if cfg.aim_mode == 'transverse_span' else 'Val MAE (m)'
         def draw_fig07(lang):
             fig, axes = plt.subplots(1, 2, figsize=(12, 4))
             axes[0].plot(ep, history['train_loss'], label='train')
@@ -2210,7 +2511,7 @@ def export_figures_and_tables(cfg: Config, df: pd.DataFrame, cluster_data: dict,
             axes[0].set_title('训练与验证损失' if lang == 'zh' else 'Training & Validation Loss')
             axes[1].plot(ep, history['val_mae'])
             axes[1].set_xlabel('轮次' if lang == 'zh' else 'Epoch')
-            axes[1].set_ylabel('验证 MAE (m)' if lang == 'zh' else 'Val MAE (m)')
+            axes[1].set_ylabel(_mae_label_zh if lang == 'zh' else _mae_label_en)
             axes[1].set_title('验证 MAE' if lang == 'zh' else 'Validation MAE')
             fig.suptitle('图7 Transformer 训练曲线' if lang == 'zh' else 'Fig. 7 Transformer training curves')
             return fig
@@ -2228,24 +2529,39 @@ def export_figures_and_tables(cfg: Config, df: pd.DataFrame, cluster_data: dict,
     # === 图 12 + 表 6: 年度策略对比 ===
     if annual:
         adf = annual['annual_summary']
+        _has_sigma = 'annual_sigma_surface' in adf.columns
         def draw_fig12(lang):
-            fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+            n_panels = 3 if _has_sigma else 2
+            fig, axes = plt.subplots(1, n_panels, figsize=(6 * n_panels, 5))
             axes[0].bar(adf['strategy'], adf['annual_eta_opt'], color='steelblue')
             axes[0].set_ylabel('年度 η_opt' if lang == 'zh' else 'Annual η_opt')
-            axes[0].set_title('年度光学效率对比' if lang == 'zh' else 'Annual optical efficiency')
+            axes[0].set_title('年度光学效率' if lang == 'zh' else 'Annual optical efficiency')
             for i, v in enumerate(adf['annual_eta_opt']):
                 axes[0].text(i, v + 0.005, f'{v:.3f}', ha='center')
-            axes[1].bar(adf['strategy'], adf['annual_cv_circ'], color='salmon')
-            axes[1].set_ylabel('年度 CV_circ' if lang == 'zh' else 'Annual CV_circ')
-            axes[1].set_title('年度圆周变异系数' if lang == 'zh' else 'Annual circumferential CV')
-            for i, v in enumerate(adf['annual_cv_circ']):
-                axes[1].text(i, v + 0.01, f'{v:.3f}', ha='center')
+            if _has_sigma:
+                axes[1].bar(adf['strategy'], adf['annual_sigma_surface'], color='coral')
+                axes[1].set_ylabel('年度 σ_surface' if lang == 'zh' else 'Annual σ_surface')
+                axes[1].set_title('年度表面能流标准差' if lang == 'zh' else 'Annual surface flux std.')
+                for i, v in enumerate(adf['annual_sigma_surface']):
+                    axes[1].text(i, v + 0.01, f'{v:.3f}', ha='center')
+                if n_panels > 2 and 'annual_par_full' in adf.columns:
+                    axes[2].bar(adf['strategy'], adf['annual_par_full'], color='mediumpurple')
+                    axes[2].set_ylabel('年度 PAR_full' if lang == 'zh' else 'Annual PAR_full')
+                    axes[2].set_title('年度峰均比' if lang == 'zh' else 'Annual peak-to-avg ratio')
+                    for i, v in enumerate(adf['annual_par_full']):
+                        axes[2].text(i, v + 0.05, f'{v:.3f}', ha='center')
+            else:
+                axes[1].bar(adf['strategy'], adf['annual_cv_circ'], color='salmon')
+                axes[1].set_ylabel('年度 CV_circ' if lang == 'zh' else 'Annual CV_circ')
+                axes[1].set_title('年度圆周变异系数' if lang == 'zh' else 'Annual circumferential CV')
+                for i, v in enumerate(adf['annual_cv_circ']):
+                    axes[1].text(i, v + 0.01, f'{v:.3f}', ha='center')
             for ax in axes:
                 ax.tick_params(axis='x', rotation=20)
             fig.suptitle('图12 年度策略对比' if lang == 'zh' else 'Fig. 12 Annual strategy comparison')
             return fig
         save_bilingual_figure(fig_dir / 'fig12_annual_comparison.png', draw_fig12)
-        
+
         adf.to_csv(tab_dir / 'tab06_annual.csv', index=False)
         adf.to_markdown(tab_dir / 'tab06_annual.md', index=False)
         if isinstance(annual, dict) and 'annual_details' in annual:
@@ -2260,7 +2576,8 @@ def export_figures_and_tables(cfg: Config, df: pd.DataFrame, cluster_data: dict,
     samples_df['month'] = samples_df['ts'].dt.month
     samples_df['hr'] = samples_df['ts'].dt.hour
     pivot_eta = samples_df.pivot_table(index='month', columns='hr', values='eta_opt', aggfunc='mean')
-    pivot_cv = samples_df.pivot_table(index='month', columns='hr', values='cv_circ', aggfunc='mean')
+    _heatmap_col2 = 'sigma_surface' if 'sigma_surface' in samples_df.columns else 'cv_circ'
+    pivot_uni = samples_df.pivot_table(index='month', columns='hr', values=_heatmap_col2, aggfunc='mean')
     def draw_fig11(lang):
         fig, axes = plt.subplots(1, 2, figsize=(14, 5))
         im0 = axes[0].imshow(pivot_eta, aspect='auto', cmap='viridis', origin='lower')
@@ -2268,10 +2585,10 @@ def export_figures_and_tables(cfg: Config, df: pd.DataFrame, cluster_data: dict,
         axes[0].set_ylabel('月份' if lang == 'zh' else 'Month')
         axes[0].set_title('η_opt')
         fig.colorbar(im0, ax=axes[0])
-        im1 = axes[1].imshow(pivot_cv, aspect='auto', cmap='magma_r', origin='lower')
+        im1 = axes[1].imshow(pivot_uni, aspect='auto', cmap='magma_r', origin='lower')
         axes[1].set_xlabel('小时' if lang == 'zh' else 'Hour')
         axes[1].set_ylabel('月份' if lang == 'zh' else 'Month')
-        axes[1].set_title('CV_circ')
+        axes[1].set_title('σ_surface' if _heatmap_col2 == 'sigma_surface' else 'CV_circ')
         fig.colorbar(im1, ax=axes[1])
         fig.suptitle('图11 年度性能热力图（BO优化策略）' if lang == 'zh' else 'Fig. 11 Annual performance heatmaps (BO strategy)')
         return fig
@@ -2286,6 +2603,22 @@ def export_figures_and_tables(cfg: Config, df: pd.DataFrame, cluster_data: dict,
 def export_tonatiuh_all_training_cases(cfg, cluster_data, bo_data, formulas, workdir):
     """导出 bo_data['samples'] 全部 BO 训练/优化样本的 Tonatiuh 手动验证数据。"""
     del cluster_data, formulas  # 该导出仅依赖 bo_data 样本
+
+    # transverse_span 模式下旧版 Tonatiuh 导出语义错误，跳过
+    if cfg.aim_mode == 'transverse_span':
+        out_dir = Path(workdir) / 'tonatiuh_aiming'
+        out_dir.mkdir(exist_ok=True)
+        readme_path = out_dir / 'README_transverse_span_not_exported.md'
+        with open(readme_path, 'w', encoding='utf-8') as f:
+            f.write(
+                "# Tonatiuh export skipped\n\n"
+                "当前 aim_mode='transverse_span'，优化变量为横截面 x_aim/span，"
+                "旧版 Tonatiuh 导出函数仍按 longitudinal z_aim 解释，容易产生错误语义。\n\n"
+                "本次实验先不使用 Tonatiuh 导出。如需后续导出，应改为 "
+                "target_point=(x_aim, 0, receiver_height)。\n"
+            )
+        return
+
     samples = bo_data['samples'].copy()
     samples = samples.sort_values(['cluster', 'sample_idx']).reset_index(drop=True)
 
