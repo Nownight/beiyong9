@@ -200,22 +200,31 @@ class Config:
     n_phi_bins: int = 36
     n_z_bins: int = 50
     max_cpc_bounces: int = 10
-    mcrt_backend: str = 'numpy_cpu'  # numpy_cpu / torch_cuda_experimental
-    mcrt_gpu_validate_on_start: bool = True
-    mcrt_gpu_parity_rays: int = 5000
-    mcrt_gpu_parity_tol_eta: float = 0.05
-    mcrt_gpu_parity_tol_sigma: float = 0.08
+    mcrt_backend: str = 'numpy_cpu'
     mcrt_num_workers: int = 1
-    
+    mcrt_deterministic: bool = True
+
     # BO
     bo_n_initial: int = 30
     bo_n_iterations: int = 80
     bo_ref_point: tuple = (0.30, -1.5)  # (eta_opt 最低, -uniformity 最高)
     bo_force_s1_initial: bool = True
-    experiment_mode: str = 'span_1d'  # span_1d / grouped_span / fixed_scan / compare_all
+    experiment_mode: str = 'grouped_span'  # grouped_span / span_1d / fixed_scan / compare_all
     fixed_span_values: tuple = (0.0, 0.015, 0.025, 0.035, 0.04)
+    fixed_scan_only: bool = True
     grouped_span_bounds: tuple = ((0.0, 0.025), (0.0, 0.040), (0.0, 0.050))
     grouped_span_enable_gamma: bool = False
+    bo_objective_mode: str = 'dni_weighted_thermal'
+    dni_low: float = 300.0
+    dni_high: float = 800.0
+    thermal_lambda_par: float = 0.20
+    thermal_lambda_top: float = 0.25
+    par_full_target: float = 3.0
+    top_flux_target: float = 0.38
+    eta_floor_low_dni: float = 0.98
+    eta_floor_mid_dni: float = 0.96
+    eta_floor_high_dni: float = 0.94
+    annual_eta_floor_rel: float = 0.96
     
     # Transformer
     nn_d_model: int = 128
@@ -314,6 +323,60 @@ def _save_pickle_with_hash(path: Path, payload: dict, cfg: Config):
     payload['config_hash'] = compute_config_hash(cfg)
     with open(path, 'wb') as f:
         pickle.dump(payload, f)
+
+
+# ==================== DNI 风险权重与 BO 目标函数 ====================
+
+def dni_risk_weight(dni, cfg):
+    """DNI 风险权重，范围 [0, 1]。高 DNI 时热风险大，更重视热斑和顶部暗区。"""
+    return float(np.clip(
+        (float(dni) - cfg.dni_low) / (cfg.dni_high - cfg.dni_low + 1e-12),
+        0.0, 1.0
+    ))
+
+
+def effective_eta_floor_rel(dni, cfg):
+    """单工况效率底线。低 DNI 保守（高底线）；高 DNI 允许略多效率损失以改善热斑。"""
+    risk = dni_risk_weight(dni, cfg)
+    if risk < 0.33:
+        return cfg.eta_floor_low_dni
+    if risk < 0.66:
+        return cfg.eta_floor_mid_dni
+    return cfg.eta_floor_high_dni
+
+
+def compute_bo_uniformity_objective(metrics, dni, cfg):
+    """BO 第二目标，越小越好。默认生产目标为 DNI 加权热斑风险目标。"""
+    sigma = float(metrics.get('sigma_surface', metrics.get('cv_circ', 0.0)))
+
+    if cfg.bo_objective_mode == 'sigma_surface':
+        return sigma
+
+    risk = dni_risk_weight(dni, cfg)
+    par_full = float(metrics.get('par_full', 0.0))
+    top_ratio = float(metrics.get('top_flux_ratio', 0.0))
+    par_excess = max(0.0, par_full - cfg.par_full_target) / (cfg.par_full_target + 1e-12)
+    top_dark_penalty = max(0.0, cfg.top_flux_target - top_ratio) / (cfg.top_flux_target + 1e-12)
+    obj = (
+        sigma
+        + cfg.thermal_lambda_par * risk * par_excess
+        + cfg.thermal_lambda_top * risk * top_dark_penalty
+    )
+    return float(obj)
+
+
+def stable_trace_seed(cfg, sun_alt_deg, sun_az_deg, dni, aim_vec, n_rays):
+    """基于调用参数生成确定性随机种子，保证同参数重复运行结果一致。"""
+    payload = {
+        'seed': cfg.seed,
+        'sun_alt': round(float(sun_alt_deg), 4),
+        'sun_az': round(float(sun_az_deg), 4),
+        'dni': round(float(dni), 4),
+        'aim': [round(float(x), 6) for x in np.asarray(aim_vec).ravel().tolist()],
+        'n_rays': int(n_rays),
+    }
+    txt = json.dumps(payload, sort_keys=True)
+    return int(hashlib.sha256(txt.encode('utf-8')).hexdigest()[:8], 16)
 
 
 # ==================== 断点管理 ====================
@@ -955,7 +1018,14 @@ class MCRTTracer:
         total_absorbed = 0.0
         
         cos_inc_global = self._compute_cos_inc(sun_alt_deg, sun_az_deg)
-        
+
+        # 提前展开 aim_vec 以便确定性种子计算
+        aim_vec = np.asarray(aim_z, dtype=float).ravel()
+        if self.cfg.mcrt_deterministic:
+            rng = np.random.default_rng(stable_trace_seed(self.cfg, sun_alt_deg, sun_az_deg, dni, aim_vec, n_rays))
+        else:
+            rng = np.random.default_rng()
+
         # 计算 IAM (阴影 + 遮挡 + 端部损失) - 全部镜面一次性计算
         iam_array, iam_components = self.geo.compute_iam(sun_alt_deg, sun_az_deg)
         
@@ -986,7 +1056,6 @@ class MCRTTracer:
                 continue  # 整面镜都被遮蔽,跳过
             
             # 该镜的法向量
-            aim_vec = np.asarray(aim_z, dtype=float).ravel()
             if self.cfg.aim_mode == 'transverse_span':
                 # 新版：光斑打在集热管横截面的不同 x 位置
                 x_aim_i = float(aim_vec[i])
@@ -1008,8 +1077,8 @@ class MCRTTracer:
             nx, nz = nx / nlen, nz / nlen
             
             # 在镜面采样光线起点
-            ray_x0 = mx + (np.random.rand(n_per_mirror) - 0.5) * mw
-            ray_y0 = (np.random.rand(n_per_mirror) - 0.5) * self.L
+            ray_x0 = mx + (rng.random(n_per_mirror) - 0.5) * mw
+            ray_y0 = (rng.random(n_per_mirror) - 0.5) * self.L
             ray_z0 = np.zeros(n_per_mirror)
             
             # === 抛物面镜局部法向修正 ===
@@ -1042,12 +1111,12 @@ class MCRTTracer:
             # 3. 太阳张角 (sunshape)          - 入射光本身锥角分布 (Pillbox 等概率, 半角 4.65 mrad)
             sigma_normal = np.sqrt(self.cfg.slope_error_mrad**2 + self.cfg.tracking_error_mrad**2) / 1000
             # 法向误差导致反射偏移 2σ
-            err_x_normal = np.random.normal(0, 2 * sigma_normal, n_per_mirror)
-            err_y_normal = np.random.normal(0, 2 * sigma_normal, n_per_mirror)
-            
+            err_x_normal = rng.normal(0, 2 * sigma_normal, n_per_mirror)
+            err_y_normal = rng.normal(0, 2 * sigma_normal, n_per_mirror)
+
             # 太阳张角 (Pillbox: 在半角内均匀分布)
-            r_sun = sun_half_angle_mrad / 1000 * np.sqrt(np.random.rand(n_per_mirror))
-            phi_sun = 2 * np.pi * np.random.rand(n_per_mirror)
+            r_sun = sun_half_angle_mrad / 1000 * np.sqrt(rng.random(n_per_mirror))
+            phi_sun = 2 * np.pi * rng.random(n_per_mirror)
             err_x_sun = r_sun * np.cos(phi_sun)
             err_y_sun = r_sun * np.sin(phi_sun)
             
@@ -1340,57 +1409,18 @@ class MCRTTracer:
                 'q_mean_full': float(q_mean_full)}
 
 
-class MCRTTracerTorch(MCRTTracer):
-    """
-    占位类：当前版本仍复用 NumPy CPU 路径，不提供 MCRT GPU 加速。
-    不应用于正式声称 GPU 加速。
-    """
-    def trace(self, sun_alt_deg, sun_az_deg, aim_z, dni, n_rays=None):
-        if self.cfg.aim_mode != 'transverse_span':
-            raise NotImplementedError("MCRTTracerTorch 目前仅支持 transverse_span。")
-        return super().trace(sun_alt_deg, sun_az_deg, aim_z, dni, n_rays=n_rays)
-
-
 def create_mcrt_tracer(cfg, geo, logger=None):
-    if cfg.mcrt_backend == 'torch_cuda_experimental':
+    if getattr(cfg, 'mcrt_backend', 'numpy_cpu') != 'numpy_cpu':
         if logger:
-            logger.warn(
-                "torch_cuda_experimental 当前仍复用 NumPy CPU 光追路径，"
-                "尚未实现真正 MCRT GPU 加速；自动回退到 numpy_cpu。"
-            )
+            logger.warn("当前生产版仅支持 MCRT numpy_cpu；已回退 numpy_cpu。")
         cfg.mcrt_backend = 'numpy_cpu'
     return MCRTTracer(cfg, geo)
 
 
 def describe_runtime_backend(cfg, logger):
-    nn_device = cfg.get_device()
-    logger.info(f"NN device: {nn_device}")
-    logger.info(f"MCRT backend: {cfg.mcrt_backend}")
-    if cfg.mcrt_backend == 'numpy_cpu':
-        logger.warn("当前 MCRT 光追为 NumPy CPU 实现，GPU 只用于 Transformer，不会加速 MCRT。")
-
-
-def validate_mcrt_backend_parity(cfg, cluster_data, logger):
-    if cfg.mcrt_backend != 'torch_cuda_experimental' or not cfg.mcrt_gpu_validate_on_start:
-        return
-    if not (HAS_TORCH and torch.cuda.is_available()):
-        cfg.mcrt_backend = 'numpy_cpu'
-        return
-    rep = cluster_data['representatives'].iloc[0]
-    row = cluster_data['df'].iloc[int(rep['rep_idx'])]
-    geo = LFRGeometry(cfg)
-    cpu = MCRTTracer(cfg, geo)
-    gpu = MCRTTracerTorch(cfg, geo)
-    for span in (0.0, 0.035):
-        aim = make_xaim_from_span(cfg, span)
-        _, mc = cpu.trace(row['solar_alt'], row['solar_az'], aim, row['DNI'], n_rays=cfg.mcrt_gpu_parity_rays)
-        _, mg = gpu.trace(row['solar_alt'], row['solar_az'], aim, row['DNI'], n_rays=cfg.mcrt_gpu_parity_rays)
-        de = abs(mg['eta_opt'] - mc['eta_opt'])
-        ds = abs(mg['sigma_surface'] - mc['sigma_surface'])
-        if de > cfg.mcrt_gpu_parity_tol_eta or ds > cfg.mcrt_gpu_parity_tol_sigma:
-            logger.warn("GPU MCRT 与 CPU 差异过大，回退 numpy_cpu")
-            cfg.mcrt_backend = 'numpy_cpu'
-            return
+    logger.info(f"NN device: {cfg.get_device()}")
+    logger.info("MCRT backend: numpy_cpu")
+    logger.warn("当前 MCRT 光追为 NumPy CPU 实现；GPU 只用于 Transformer，不加速 MCRT。")
 
 
 # ==================== 5. 基线策略 ====================
@@ -1721,8 +1751,8 @@ def stage_bo(cfg: Config, df: pd.DataFrame, cluster_data: dict,
                         aim = x
                 _, m = mcrt.trace(_hr['solar_alt'], _hr['solar_az'],
                                   aim, _hr['DNI'], n_rays=cfg.n_rays_eval)
-                uniformity = m.get(uniformity_key, m.get('sigma_surface', m['cv_circ']))
-                return m['eta_opt'], uniformity
+                objective = compute_bo_uniformity_objective(m, _hr['DNI'], cfg)
+                return m['eta_opt'], objective
 
             bo = SimpleMOBO(dim, bounds, n_initial=cfg.bo_n_initial,
                             n_iter=cfg.bo_n_iterations, seed=cfg.seed + ci * 100 + si)
@@ -1748,8 +1778,9 @@ def stage_bo(cfg: Config, df: pd.DataFrame, cluster_data: dict,
                 stop_check=stop.check,
                 initial_points=initial_points,
             )
+            eta_floor_rel_eff = effective_eta_floor_rel(hour_row['DNI'], cfg)
             selected_x, selected_y, selected_reason, s1_y = select_bo_label_with_eta_floor(
-                X, Y, pmask, x_s1, eta_floor_rel=cfg.bo_eta_floor_rel
+                X, Y, pmask, x_s1, eta_floor_rel=eta_floor_rel_eff
             )
 
             # 获取完整 metrics（对 selected_x 再调用一次 trace）
@@ -1785,7 +1816,7 @@ def stage_bo(cfg: Config, df: pd.DataFrame, cluster_data: dict,
                 'solar_az': float(hour_row['solar_az']),
                 'cos_inc': float(hour_row['cos_inc']),
                 'dni': float(hour_row['DNI']),
-                'aim_optimal': selected_x.tolist(),  # 1D [span] in transverse_span mode
+                'aim_optimal': selected_x.tolist(),
                 'eta_opt': float(selected_y[0]),
                 'cv_circ': float(selected_metrics['cv_circ']),
                 'aim_mode': cfg.aim_mode,
@@ -1808,6 +1839,9 @@ def stage_bo(cfg: Config, df: pd.DataFrame, cluster_data: dict,
                 's1_sigma_surface': float(s1_metrics['sigma_surface']),
                 's1_cv_circ': float(s1_metrics['cv_circ']),
                 'eta_floor_rel': float(cfg.bo_eta_floor_rel),
+                'eta_floor_rel_effective': float(eta_floor_rel_eff),
+                'dni_risk_weight': float(dni_risk_weight(hour_row['DNI'], cfg)),
+                'bo_objective_mode': cfg.bo_objective_mode,
                 'timestamp': str(hour_row['timestamp']),
             })
             if cluster_id not in pareto_data:
@@ -2051,7 +2085,15 @@ def stage_train(cfg: Config, bo_data: dict, logger: Logger,
     with open(history_path, 'w') as f:
         json.dump(history, f, indent=2)
     with open(model_meta_path, 'w') as f:
-        json.dump({'config_hash': compute_config_hash(cfg), 'dim': int(dim), 'aim_mode': cfg.aim_mode}, f, indent=2)
+        json.dump({
+            'config_hash': compute_config_hash(cfg),
+            'dim': int(dim),
+            'aim_mode': cfg.aim_mode,
+            'experiment_mode': cfg.experiment_mode,
+            'output_low': output_low.tolist() if hasattr(output_low, 'tolist') else float(output_low),
+            'output_high': output_high.tolist() if hasattr(output_high, 'tolist') else float(output_high),
+            'output_activation': output_activation,
+        }, f, indent=2)
     
     ckpt.mark_done('train')
     return out_path, history
@@ -2089,10 +2131,13 @@ def stage_distill(cfg: Config, bo_data: dict, train_path: Path,
     
     formulas = {}
     
-    def _formula_key(i, dim, aim_mode):
-        """在 transverse_span 模式下输出维度=1，命名为 span 而非 z_1"""
-        if aim_mode == 'transverse_span' and dim == 1 and i == 0:
-            return 'span'
+    def _formula_key(i, dim, cfg):
+        """在 transverse_span 模式下按维度命名；grouped_span 输出 span_inner/mid/outer。"""
+        if cfg.aim_mode == 'transverse_span':
+            if cfg.experiment_mode == 'grouped_span' and dim == 3:
+                return ['span_inner', 'span_mid', 'span_outer'][i]
+            if dim == 1 and i == 0:
+                return 'span'
         return f'z_{i+1}'
 
     HAS_PYSR_LOCAL = False
@@ -2110,7 +2155,7 @@ def stage_distill(cfg: Config, bo_data: dict, train_path: Path,
         from sklearn.pipeline import Pipeline
         for i in range(dim):
             stop.check()
-            key = _formula_key(i, dim, cfg.aim_mode)
+            key = _formula_key(i, dim, cfg)
             pipe = Pipeline([
                 ('poly', PolynomialFeatures(degree=3, include_bias=False)),
                 ('reg', Ridge(alpha=1.0))
@@ -2131,7 +2176,7 @@ def stage_distill(cfg: Config, bo_data: dict, train_path: Path,
     else:
         for i in range(dim):
             stop.check()
-            key = _formula_key(i, dim, cfg.aim_mode)
+            key = _formula_key(i, dim, cfg)
             sr = PySRRegressor(
                 niterations=cfg.pysr_iterations,
                 population_size=cfg.pysr_population,
@@ -2352,6 +2397,44 @@ def stage_annual(cfg: Config, df: pd.DataFrame, cluster_data: dict,
     })
     annual_detail_records.extend(bo_recs)
 
+    # --- Paper_fixed_span_0.035 (文献固定横截面分散策略对照) ---
+    paper_recs = []
+    for _, rep in rep_df.iterrows():
+        stop.check()
+        cluster_id = rep['cluster']
+        row = cluster_data['df'].iloc[rep['rep_idx']]
+        aim = make_xaim_from_span(cfg, cfg.paper_xaim_span)
+        _, m = mcrt.trace(row['solar_alt'], row['solar_az'], aim, row['DNI'],
+                          n_rays=cfg.n_rays_validate)
+        paper_recs.append({
+            'cluster': int(cluster_id),
+            'strategy': 'Paper_fixed_span_0.035',
+            'eta_opt': float(m['eta_opt']),
+            'sigma_surface': float(m['sigma_surface']),
+            'cv_circ': float(m['cv_circ']),
+            'par_full': float(m['par_full']),
+            'top_flux_ratio': float(m['top_flux_ratio']),
+            'span': float(cfg.paper_xaim_span),
+            'span_inner': np.nan,
+            'span_mid': np.nan,
+            'span_outer': np.nan,
+            'span_vector': None,
+            'strategy_param_mode': 'paper_fixed_span',
+            'source_sample_idx': -1,
+            'distance_to_rep': 0.0,
+            'weight': float(weights[cluster_id]),
+        })
+    eta_paper, sig_paper, cv_paper, par_paper, top_paper = _weighted_metrics(paper_recs)
+    annual_records.append({
+        'strategy': 'Paper_fixed_span_0.035',
+        'annual_eta_opt': eta_paper,
+        'annual_sigma_surface': sig_paper,
+        'annual_cv_circ': cv_paper,
+        'annual_par_full': par_paper,
+        'annual_top_flux_ratio': top_paper,
+    })
+    annual_detail_records.extend(paper_recs)
+
     # --- NN_adaptive_span / NN_grouped_span (optional) ---
     if HAS_TORCH and train_path is not None and Path(train_path).exists():
         try:
@@ -2368,6 +2451,31 @@ def stage_annual(cfg: Config, df: pd.DataFrame, cluster_data: dict,
             else:
                 output_low, output_high = cfg.z_range
                 output_activation = 'tanh'
+            # 模型 meta 验证：防止 span_1d 模型误用于 grouped_span
+            model_meta_path = workdir / 'model_meta.json'
+            if model_meta_path.exists():
+                meta = json.load(open(model_meta_path))
+                meta_ok = True
+                try:
+                    _validate_cached_hash(meta.get('config_hash'), cfg, 'model_meta.json')
+                except RuntimeError as _e:
+                    logger.warn(f"model_meta config_hash 不匹配，跳过 {nn_strategy_name}: {_e}")
+                    meta_ok = False
+                if meta_ok and meta.get('dim') != bo_data['dim']:
+                    logger.warn(f"model_meta dim={meta.get('dim')} != bo_data dim={bo_data['dim']}，跳过 {nn_strategy_name}")
+                    meta_ok = False
+                if meta_ok and meta.get('experiment_mode') and meta.get('experiment_mode') != cfg.experiment_mode:
+                    logger.warn(f"model_meta experiment_mode={meta.get('experiment_mode')} != {cfg.experiment_mode}，跳过 {nn_strategy_name}")
+                    meta_ok = False
+                if meta_ok and meta.get('aim_mode') and meta.get('aim_mode') != cfg.aim_mode:
+                    logger.warn(f"model_meta aim_mode={meta.get('aim_mode')} != {cfg.aim_mode}，跳过 {nn_strategy_name}")
+                    meta_ok = False
+                if not meta_ok:
+                    raise RuntimeError("model_meta 验证失败，跳过 NN 推理")
+            else:
+                logger.warn(f"model_meta.json 不存在，跳过 {nn_strategy_name}")
+                raise RuntimeError("缺少 model_meta.json")
+
             model = AimTransformer(n_mirrors_half=dim, d_model=cfg.nn_d_model,
                                    n_heads=cfg.nn_n_heads, n_layers=cfg.nn_n_layers,
                                    n_clusters=cfg.n_clusters,
@@ -2447,6 +2555,26 @@ def stage_annual(cfg: Config, df: pd.DataFrame, cluster_data: dict,
             logger.warn(f"NN 推理失败，跳过 {nn_strategy_name}: {e}")
 
     annual_df = pd.DataFrame(annual_records)
+
+    # 年度相对 S1 指标
+    s1_row = annual_df[annual_df['strategy'] == 'S1_center']
+    if len(s1_row) > 0:
+        s1_eta = float(s1_row.iloc[0]['annual_eta_opt'])
+        s1_sigma = float(s1_row.iloc[0].get('annual_sigma_surface', 0.0))
+        s1_par = float(s1_row.iloc[0].get('annual_par_full', 0.0))
+        s1_top = float(s1_row.iloc[0].get('annual_top_flux_ratio', 0.0))
+        annual_df['eta_rel_to_s1'] = annual_df['annual_eta_opt'] / (s1_eta + 1e-12)
+        annual_df['sigma_improve_pct'] = (s1_sigma - annual_df['annual_sigma_surface']) / (s1_sigma + 1e-12) * 100.0
+        annual_df['par_improve_pct'] = (s1_par - annual_df['annual_par_full']) / (s1_par + 1e-12) * 100.0
+        annual_df['top_flux_improve_pct'] = (annual_df['annual_top_flux_ratio'] - s1_top) / (s1_top + 1e-12) * 100.0
+        annual_df['meets_annual_eta_floor'] = annual_df['eta_rel_to_s1'] >= cfg.annual_eta_floor_rel
+        # S1 自己的相对值
+        annual_df.loc[annual_df['strategy'] == 'S1_center', 'eta_rel_to_s1'] = 1.0
+        annual_df.loc[annual_df['strategy'] == 'S1_center', 'sigma_improve_pct'] = 0.0
+        annual_df.loc[annual_df['strategy'] == 'S1_center', 'par_improve_pct'] = 0.0
+        annual_df.loc[annual_df['strategy'] == 'S1_center', 'top_flux_improve_pct'] = 0.0
+        annual_df.loc[annual_df['strategy'] == 'S1_center', 'meets_annual_eta_floor'] = True
+
     out = {
         'annual_summary': annual_df,
         'annual_details': pd.DataFrame(annual_detail_records),
@@ -2521,12 +2649,14 @@ def stage_sensitivity_fixed_span(cfg: Config, df: pd.DataFrame, cluster_data: di
 
 
 def export_strategy_screening_table(cfg: Config, annual: Optional[dict], bo_data: Optional[dict], sensitivity: Optional[dict]):
-    if cfg.experiment_mode != 'compare_all':
+    if annual is None and sensitivity is None:
         return
     workdir = Path(cfg.workdir)
     tab_dir = workdir / 'tables'
     tab_dir.mkdir(exist_ok=True)
     rows = []
+
+    # 来自固定扫描的诊断行
     if sensitivity and 'scan' in sensitivity:
         scan = sensitivity['scan']
         for s in [0.0, 0.015, 0.025, 0.035, 0.04]:
@@ -2534,31 +2664,79 @@ def export_strategy_screening_table(cfg: Config, annual: Optional[dict], bo_data
             if len(sub) == 0:
                 continue
             r = sub.iloc[0]
-            rows.append({'strategy': 'S1_center' if s == 0 else f'S_fixed_span_{str(s).replace(".", "")}',
-                         'annual_eta_opt': r['annual_eta_opt'], 'annual_sigma_surface': r['annual_sigma_surface'],
-                         'annual_par_full': r['annual_par_full'], 'annual_top_flux_ratio': r['annual_top_flux_ratio'],
-                         'eta_rel_to_s1': r['eta_rel_to_s1'], 'sigma_improve_pct': r['sigma_improve_pct'],
-                         'par_improve_pct': r['par_improve_pct'], 'top_flux_improve_pct': r['top_flux_improve_pct'],
-                         'runtime_minutes': np.nan})
+            rows.append({
+                'strategy': 'S1_center' if s == 0 else f'S_fixed_span_{str(s).replace(".", "")}',
+                'annual_eta_opt': r['annual_eta_opt'],
+                'annual_sigma_surface': r['annual_sigma_surface'],
+                'annual_par_full': r.get('annual_par_full', np.nan),
+                'annual_top_flux_ratio': r.get('annual_top_flux_ratio', np.nan),
+                'eta_rel_to_s1': r.get('eta_rel_to_s1', np.nan),
+                'sigma_improve_pct': r.get('sigma_improve_pct', np.nan),
+                'par_improve_pct': r.get('par_improve_pct', np.nan),
+                'top_flux_improve_pct': r.get('top_flux_improve_pct', np.nan),
+                'meets_annual_eta_floor': r.get('eta_rel_to_s1', 1.0) >= cfg.annual_eta_floor_rel,
+                'runtime_minutes': np.nan,
+            })
+
+    # 来自年度对比的主策略行（含相对 S1 指标）
     if annual and 'annual_summary' in annual:
         adf = annual['annual_summary']
-        s1 = adf[adf['strategy'] == 'S1_center'].iloc[0] if len(adf[adf['strategy'] == 'S1_center']) else None
+        s1_rows = adf[adf['strategy'] == 'S1_center']
+        s1 = s1_rows.iloc[0] if len(s1_rows) > 0 else None
         for _, r in adf.iterrows():
             if r['strategy'] == 'S1_center':
                 continue
-            rows.append({'strategy': r['strategy'], 'annual_eta_opt': r['annual_eta_opt'],
-                         'annual_sigma_surface': r.get('annual_sigma_surface', np.nan),
-                         'annual_par_full': r.get('annual_par_full', np.nan),
-                         'annual_top_flux_ratio': r.get('annual_top_flux_ratio', np.nan),
-                         'eta_rel_to_s1': (r['annual_eta_opt'] / s1['annual_eta_opt']) if s1 is not None else np.nan,
-                         'sigma_improve_pct': ((s1.get('annual_sigma_surface', np.nan) - r.get('annual_sigma_surface', np.nan)) / (s1.get('annual_sigma_surface', np.nan) + 1e-12) * 100.0) if s1 is not None else np.nan,
-                         'par_improve_pct': np.nan, 'top_flux_improve_pct': np.nan, 'runtime_minutes': np.nan})
+            strat_name = r['strategy']
+            # 避免与 sensitivity 行重复（sensitivity 行策略名格式不同）
+            if any(row['strategy'] == strat_name for row in rows):
+                continue
+            s1_eta = float(s1['annual_eta_opt']) if s1 is not None else (r['annual_eta_opt'] + 1e-12)
+            s1_sigma = float(s1.get('annual_sigma_surface', 0.0)) if s1 is not None else 0.0
+            s1_par = float(s1.get('annual_par_full', 0.0)) if s1 is not None else 0.0
+            s1_top = float(s1.get('annual_top_flux_ratio', 0.0)) if s1 is not None else 0.0
+            eta_rel = r['annual_eta_opt'] / (s1_eta + 1e-12) if s1 is not None else np.nan
+            sig_imp = (s1_sigma - r.get('annual_sigma_surface', 0.0)) / (s1_sigma + 1e-12) * 100.0 if s1 is not None else np.nan
+            par_imp = (s1_par - r.get('annual_par_full', 0.0)) / (s1_par + 1e-12) * 100.0 if s1 is not None else np.nan
+            top_imp = (r.get('annual_top_flux_ratio', 0.0) - s1_top) / (s1_top + 1e-12) * 100.0 if s1 is not None else np.nan
+            # 优先使用 annual_df 中已计算的列（含 S1 自校正）
+            if 'eta_rel_to_s1' in adf.columns:
+                eta_rel = r.get('eta_rel_to_s1', eta_rel)
+            if 'sigma_improve_pct' in adf.columns:
+                sig_imp = r.get('sigma_improve_pct', sig_imp)
+            if 'par_improve_pct' in adf.columns:
+                par_imp = r.get('par_improve_pct', par_imp)
+            if 'top_flux_improve_pct' in adf.columns:
+                top_imp = r.get('top_flux_improve_pct', top_imp)
+            meets = bool(eta_rel >= cfg.annual_eta_floor_rel) if not np.isnan(eta_rel) else False
+            if 'meets_annual_eta_floor' in adf.columns:
+                meets = bool(r.get('meets_annual_eta_floor', meets))
+            rows.append({
+                'strategy': strat_name,
+                'annual_eta_opt': r['annual_eta_opt'],
+                'annual_sigma_surface': r.get('annual_sigma_surface', np.nan),
+                'annual_par_full': r.get('annual_par_full', np.nan),
+                'annual_top_flux_ratio': r.get('annual_top_flux_ratio', np.nan),
+                'eta_rel_to_s1': eta_rel,
+                'sigma_improve_pct': sig_imp,
+                'par_improve_pct': par_imp,
+                'top_flux_improve_pct': top_imp,
+                'meets_annual_eta_floor': meets,
+                'runtime_minutes': np.nan,
+            })
+
     if rows:
         out = pd.DataFrame(rows)
         def _rec(rr):
-            if rr['eta_rel_to_s1'] >= 0.96 and rr['sigma_improve_pct'] >= 5:
+            meets = bool(rr.get('meets_annual_eta_floor', False))
+            sig_imp = rr.get('sigma_improve_pct', 0.0)
+            par_imp = rr.get('par_improve_pct', 0.0)
+            if np.isnan(sig_imp):
+                sig_imp = 0.0
+            if np.isnan(par_imp):
+                par_imp = 0.0
+            if meets and sig_imp >= 5 and par_imp > 0:
                 return 'promising_main_strategy'
-            if rr['eta_rel_to_s1'] >= 0.96 and rr['sigma_improve_pct'] > 0:
+            if meets and sig_imp > 0:
                 return 'mild_improvement'
             return 'not_recommended'
         out['recommendation'] = out.apply(_rec, axis=1)
@@ -3248,6 +3426,10 @@ def run_pipeline(cfg: Config, logger: Logger, stop: StopSignal,
     all_stages = ['data', 'cluster', 'baseline', 'bo', 'train', 'distill', 'annual', 'sensitivity', 'export']
     if stages_to_run is None:
         stages_to_run = all_stages
+
+    if cfg.experiment_mode == 'fixed_scan' and cfg.fixed_scan_only:
+        stages_to_run = [s for s in stages_to_run if s in ('data', 'cluster', 'sensitivity', 'export')]
+        logger.warn("fixed_scan 模式且 fixed_scan_only=True，仅运行 sensitivity/export，不运行 BO/train/annual。")
     
     np.random.seed(cfg.seed)
     if HAS_TORCH:
@@ -3296,7 +3478,6 @@ def run_pipeline(cfg: Config, logger: Logger, stop: StopSignal,
             if cluster_data is None:
                 with open(workdir / 'clusters.pkl', 'rb') as f:
                     cluster_data = pickle.load(f)
-            validate_mcrt_backend_parity(cfg, cluster_data, logger)
             logger.stage('baseline', 0)
             baselines = stage_baseline(cfg, cluster_data, logger, stop, ckpt)
             logger.stage('baseline', 1)
@@ -3391,14 +3572,27 @@ def run_pipeline(cfg: Config, logger: Logger, stop: StopSignal,
             export_strategy_screening_table(cfg, annual, bo_data, sensitivity)
             _mark_runtime('export', _t0, time.time())
 
+        # 确保 tab09 总是生成（即使未选 export 阶段）
+        if 'export' not in stages_to_run and (annual is not None or sensitivity is not None):
+            export_strategy_screening_table(cfg, annual, bo_data, sensitivity)
+
         if runtime_rows:
             tab_dir = workdir / 'tables'
             tab_dir.mkdir(exist_ok=True)
             pd.DataFrame(runtime_rows).to_csv(tab_dir / 'tab00_runtime_summary.csv', index=False)
-        
+
         logger.info("=" * 50)
         logger.info("✓ 全流程完成!")
         logger.info(f"结果目录: {workdir.absolute()}")
+        logger.info("")
+        logger.info("=== 最终论文主实验建议 ===")
+        logger.info("  experiment_mode='grouped_span'")
+        logger.info("  bo_objective_mode='dni_weighted_thermal'")
+        logger.info("  mcrt_backend='numpy_cpu'")
+        logger.info("  enable_pysr=False")
+        logger.info("  mcrt_deterministic=True")
+        logger.info("主对比: S1_center / Paper_fixed_span_0.035 / BO_grouped_span / NN_grouped_span")
+        logger.info("判断标准: BO_grouped_span 年度 eta >= 0.96×S1，sigma/par 改善，top_flux 提升")
         logger.status("✓ 完成")
     except InterruptedError:
         logger.warn("用户已中断,进度已保存,下次启动将自动续跑")
@@ -3522,11 +3716,11 @@ class LFRGui:
             ('BO 迭代数', 'bo_n_iterations', 80, int),
             ('NN epoch', 'nn_epochs', 200, int),
             ('MCRT 光线数', 'n_rays_eval', 50000, int),
-            ('MCRT backend', 'mcrt_backend', 'numpy_cpu', str),
             ('MCRT workers', 'mcrt_num_workers', 1, int),
             ('NN device', 'device', 'auto', str),
             ('PySR 启用', 'enable_pysr', False, bool),
-            ('Experiment mode', 'experiment_mode', 'span_1d', str),
+            ('Experiment mode', 'experiment_mode', 'grouped_span', str),
+            ('BO 目标', 'bo_objective_mode', 'dni_weighted_thermal', str),
             ('启用对称', 'use_symmetry', True, bool),
         ]
         self.cfg_vars = {}
