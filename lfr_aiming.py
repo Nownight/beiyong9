@@ -283,8 +283,22 @@ def compute_config_hash(cfg: Config) -> str:
 
 def _validate_cached_hash(cached_hash: Optional[str], cfg: Config, label: str):
     cur = compute_config_hash(cfg)
-    if cfg.config_hash_strict and cached_hash and cached_hash != cur and not cfg.force_reuse_cache:
-        raise RuntimeError(f"{label} 缓存配置与当前配置不一致。请清理对应阶段结果，或设置 force_reuse_cache=True。")
+
+    if not cfg.config_hash_strict or cfg.force_reuse_cache:
+        return
+
+    if not cached_hash:
+        raise RuntimeError(
+            f"{label} 缺少 config_hash，可能是旧版本缓存。"
+            f"请删除对应阶段结果后重跑，或设置 force_reuse_cache=True。"
+        )
+
+    if cached_hash != cur:
+        raise RuntimeError(
+            f"{label} 缓存配置与当前配置不一致。"
+            f"cached={cached_hash}, current={cur}。"
+            f"请清理对应阶段结果，或设置 force_reuse_cache=True。"
+        )
 
 
 def _load_pickle_checked(path: Path, cfg: Config, label: str):
@@ -309,14 +323,13 @@ class Checkpoint:
     
     STAGES = ['data', 'cluster', 'baseline', 'bo', 'train', 'distill', 'annual', 'sensitivity']
     
-    def __init__(self, workdir, config_hash=None):
+    def __init__(self, workdir, config_hash=None, strict=True, force=False):
         self.workdir = Path(workdir)
         self.workdir.mkdir(parents=True, exist_ok=True)
         self.state_file = self.workdir / 'checkpoint.json'
         self.state = self._load()
         self.config_hash = config_hash
-        if config_hash is not None:
-            self.ensure_hash(config_hash)
+        self.ensure_hash(config_hash, strict=strict, force=force)
     
     def _load(self):
         if self.state_file.exists():
@@ -328,14 +341,29 @@ class Checkpoint:
         with open(self.state_file, 'w') as f:
             json.dump(self.state, f, indent=2, default=str)
 
-    def ensure_hash(self, config_hash):
+    def ensure_hash(self, config_hash, strict=True, force=False):
+        if config_hash is None:
+            return
         cached = self.state.get('config_hash')
+        has_old_progress = bool(self.state.get('completed')) or bool(self.state.get('partial'))
+
         if cached is None:
+            if strict and has_old_progress and not force:
+                raise RuntimeError(
+                    "checkpoint.json 缺少 config_hash，但已有 completed/partial 进度。"
+                    "这可能是旧版本断点。请清空 checkpoint 或设置 force_reuse_cache=True。"
+                )
             self.state['config_hash'] = config_hash
             self.save()
             return
         if cached != config_hash:
-            self.state['config_hash'] = cached
+            if strict and not force:
+                raise RuntimeError(
+                    f"checkpoint 配置 hash 不一致: cached={cached}, current={config_hash}。"
+                    "请清理旧断点或设置 force_reuse_cache=True。"
+                )
+            self.state['config_hash'] = config_hash
+            self.save()
     
     def is_done(self, stage):
         return stage in self.state['completed']
@@ -1313,7 +1341,10 @@ class MCRTTracer:
 
 
 class MCRTTracerTorch(MCRTTracer):
-    """实验性 CUDA 后端（当前版本仍复用 CPU 路径，保持结果一致性）。"""
+    """
+    占位类：当前版本仍复用 NumPy CPU 路径，不提供 MCRT GPU 加速。
+    不应用于正式声称 GPU 加速。
+    """
     def trace(self, sun_alt_deg, sun_az_deg, aim_z, dni, n_rays=None):
         if self.cfg.aim_mode != 'transverse_span':
             raise NotImplementedError("MCRTTracerTorch 目前仅支持 transverse_span。")
@@ -1322,10 +1353,11 @@ class MCRTTracerTorch(MCRTTracer):
 
 def create_mcrt_tracer(cfg, geo, logger=None):
     if cfg.mcrt_backend == 'torch_cuda_experimental':
-        if HAS_TORCH and torch.cuda.is_available():
-            return MCRTTracerTorch(cfg, geo)
         if logger:
-            logger.warn("请求 torch_cuda_experimental，但 CUDA 不可用，自动回退到 numpy_cpu")
+            logger.warn(
+                "torch_cuda_experimental 当前仍复用 NumPy CPU 光追路径，"
+                "尚未实现真正 MCRT GPU 加速；自动回退到 numpy_cpu。"
+            )
         cfg.mcrt_backend = 'numpy_cpu'
     return MCRTTracer(cfg, geo)
 
@@ -1653,6 +1685,8 @@ def stage_bo(cfg: Config, df: pd.DataFrame, cluster_data: dict,
     if partial_path.exists():
         with open(partial_path, 'rb') as f:
             saved = pickle.load(f)
+        saved_hash = saved.get('config_hash') if isinstance(saved, dict) else None
+        _validate_cached_hash(saved_hash, cfg, 'bo_partial.pkl')
         samples = saved['samples']
         pareto_data = saved['pareto_data']
         logger.info(f"恢复 {len(samples)} 个已有样本")
@@ -1732,7 +1766,7 @@ def stage_bo(cfg: Config, df: pd.DataFrame, cluster_data: dict,
             else:
                 sel_span = float('nan')
                 spans = np.array([], dtype=float)
-                sel_aim = expand_aim_to_full(selected_x, cfg)
+                sel_aim = expand_aim_to_full(selected_x, cfg, geo=geo)
                 s1_aim = np.zeros(cfg.n_mirrors)
 
             _, selected_metrics = mcrt.trace(
@@ -1782,7 +1816,11 @@ def stage_bo(cfg: Config, df: pd.DataFrame, cluster_data: dict,
             done_pairs.add(pair)
 
             with open(partial_path, 'wb') as f:
-                pickle.dump({'samples': samples, 'pareto_data': pareto_data}, f)
+                pickle.dump({
+                    'samples': samples,
+                    'pareto_data': pareto_data,
+                    'config_hash': compute_config_hash(cfg)
+                }, f)
             ckpt.set_partial('bo', 'done_pairs', list(done_pairs))
 
             cur = len(samples)
@@ -1812,8 +1850,10 @@ if HAS_TORCH:
             super().__init__()
             self.n_half = n_mirrors_half
             self.input_dim = 4  # solar_alt, solar_az, cos_inc, dni
-            self.output_low = output_low
-            self.output_high = output_high
+            low = torch.as_tensor(output_low, dtype=torch.float32)
+            high = torch.as_tensor(output_high, dtype=torch.float32)
+            self.register_buffer('output_low_tensor', low)
+            self.register_buffer('output_high_tensor', high)
             self.output_activation = output_activation
             self.cluster_emb = nn.Embedding(n_clusters, d_model // 4)
             self.state_proj = nn.Linear(self.input_dim, d_model - d_model // 4)
@@ -1840,9 +1880,11 @@ if HAS_TORCH:
             x = self.encoder(x)
             raw = self.head(x).squeeze(-1)
             if self.output_activation == 'sigmoid':
-                return torch.sigmoid(raw) * (self.output_high - self.output_low) + self.output_low
+                low = self.output_low_tensor
+                high = self.output_high_tensor
+                return torch.sigmoid(raw) * (high - low) + low
             else:
-                scale = max(abs(self.output_low), abs(self.output_high))
+                scale = torch.maximum(torch.abs(self.output_low_tensor), torch.abs(self.output_high_tensor))
                 return torch.tanh(raw) * scale
 
 
@@ -1908,7 +1950,12 @@ def stage_train(cfg: Config, bo_data: dict, logger: Logger,
 
     device = cfg.get_device()
     # 输出范围随 aim_mode 变化
-    if cfg.aim_mode == 'transverse_span':
+    if cfg.aim_mode == 'transverse_span' and cfg.experiment_mode == 'grouped_span':
+        bounds = np.asarray(cfg.grouped_span_bounds, dtype=np.float32)
+        output_low = bounds[:, 0]
+        output_high = bounds[:, 1]
+        output_activation = 'sigmoid'
+    elif cfg.aim_mode == 'transverse_span':
         output_low, output_high = cfg.xaim_span_range
         output_activation = 'sigmoid'
     else:
@@ -2143,6 +2190,12 @@ def stage_annual(cfg: Config, df: pd.DataFrame, cluster_data: dict,
 
     annual_records = []
     annual_detail_records = []
+    if cfg.experiment_mode == 'grouped_span':
+        bo_strategy_name = 'BO_grouped_span'
+        nn_strategy_name = 'NN_grouped_span'
+    else:
+        bo_strategy_name = 'BO_adaptive_span'
+        nn_strategy_name = 'NN_adaptive_span'
 
     def _weighted_metrics(records_for_strategy):
         eta_total = 0.0; sigma_total = 0.0; cv_total = 0.0
@@ -2170,6 +2223,11 @@ def stage_annual(cfg: Config, df: pd.DataFrame, cluster_data: dict,
                 'par_full': r.get('par_full', 0.0),
                 'top_flux_ratio': r.get('top_flux_ratio', 0.0),
                 'span': 0.0,
+                'span_inner': np.nan,
+                'span_mid': np.nan,
+                'span_outer': np.nan,
+                'span_vector': None,
+                'strategy_param_mode': 'span_1d',
                 'source_sample_idx': -1,
                 'distance_to_rep': 0.0,
                 'weight': weights[r['cluster']],
@@ -2203,6 +2261,11 @@ def stage_annual(cfg: Config, df: pd.DataFrame, cluster_data: dict,
                 'par_full': float(m['par_full']),
                 'top_flux_ratio': float(m['top_flux_ratio']),
                 'span': 0.0,
+                'span_inner': np.nan,
+                'span_mid': np.nan,
+                'span_outer': np.nan,
+                'span_vector': None,
+                'strategy_param_mode': 'span_1d',
                 'source_sample_idx': -1,
                 'distance_to_rep': 0.0,
                 'weight': float(weights[cluster_id]),
@@ -2218,7 +2281,7 @@ def stage_annual(cfg: Config, df: pd.DataFrame, cluster_data: dict,
         })
         annual_detail_records.extend(s1_recs)
 
-    # --- BO_adaptive_span ---
+    # --- BO_adaptive_span / BO_grouped_span ---
     samples = bo_data['samples'].copy()
     dni_col = 'dni' if 'dni' in samples.columns else 'DNI'
     bo_recs = []
@@ -2233,6 +2296,11 @@ def stage_annual(cfg: Config, df: pd.DataFrame, cluster_data: dict,
             dist_min = float('nan')
             lookup_reason = 'fallback_s1_no_bo_sample'
             used_span = 0.0
+            used_span_inner = np.nan
+            used_span_mid = np.nan
+            used_span_outer = np.nan
+            used_span_vector = None
+            strategy_param_mode = 'grouped_span' if cfg.experiment_mode == 'grouped_span' else 'span_1d'
         else:
             sample_feats = c_samples[['solar_alt', 'solar_az', 'cos_inc', dni_col]].values.astype(float)
             target_feat = np.array([row['solar_alt'], row['solar_az'], row['cos_inc'], row['DNI']], dtype=float)
@@ -2240,29 +2308,42 @@ def stage_annual(cfg: Config, df: pd.DataFrame, cluster_data: dict,
             dist = np.linalg.norm((sample_feats - target_feat[None, :]) / scale, axis=1)
             nearest = c_samples.iloc[int(np.argmin(dist))]
             aim_raw = _safe_parse_aim_vector(nearest['aim_optimal'])
-            aim = expand_aim_to_full(aim_raw, cfg)
+            aim = expand_aim_to_full(aim_raw, cfg, geo=geo)
             source_sample_idx = int(nearest['sample_idx'])
             dist_min = float(np.min(dist))
             lookup_reason = 'nearest_bo_sample_same_cluster'
             used_span = float(nearest.get('span_optimal', float('nan')))
+            used_span_inner = float(nearest.get('span_inner', np.nan))
+            used_span_mid = float(nearest.get('span_mid', np.nan))
+            used_span_outer = float(nearest.get('span_outer', np.nan))
+            used_span_vector = nearest.get('span_vector', None)
+            strategy_param_mode = nearest.get(
+                'strategy_param_mode',
+                'grouped_span' if cfg.experiment_mode == 'grouped_span' else 'span_1d'
+            )
         _, m = mcrt.trace(row['solar_alt'], row['solar_az'], aim, row['DNI'],
                           n_rays=cfg.n_rays_validate)
         bo_recs.append({
             'cluster': int(cluster_id),
-            'strategy': 'BO_adaptive_span',
+            'strategy': bo_strategy_name,
             'eta_opt': float(m['eta_opt']),
             'sigma_surface': float(m['sigma_surface']),
             'cv_circ': float(m['cv_circ']),
             'par_full': float(m['par_full']),
             'top_flux_ratio': float(m['top_flux_ratio']),
             'span': used_span,
+            'span_inner': used_span_inner,
+            'span_mid': used_span_mid,
+            'span_outer': used_span_outer,
+            'span_vector': used_span_vector,
+            'strategy_param_mode': strategy_param_mode,
             'source_sample_idx': source_sample_idx,
             'distance_to_rep': dist_min,
             'weight': float(weights[cluster_id]),
         })
     eta_bo, sig_bo, cv_bo, par_bo, top_bo = _weighted_metrics(bo_recs)
     annual_records.append({
-        'strategy': 'BO_adaptive_span',
+        'strategy': bo_strategy_name,
         'annual_eta_opt': eta_bo,
         'annual_sigma_surface': sig_bo,
         'annual_cv_circ': cv_bo,
@@ -2271,12 +2352,17 @@ def stage_annual(cfg: Config, df: pd.DataFrame, cluster_data: dict,
     })
     annual_detail_records.extend(bo_recs)
 
-    # --- NN_adaptive_span (optional) ---
+    # --- NN_adaptive_span / NN_grouped_span (optional) ---
     if HAS_TORCH and train_path is not None and Path(train_path).exists():
         try:
             device = cfg.get_device()
             dim = bo_data['dim']
-            if cfg.aim_mode == 'transverse_span':
+            if cfg.aim_mode == 'transverse_span' and cfg.experiment_mode == 'grouped_span':
+                bounds = np.asarray(cfg.grouped_span_bounds, dtype=np.float32)
+                output_low = bounds[:, 0]
+                output_high = bounds[:, 1]
+                output_activation = 'sigmoid'
+            elif cfg.aim_mode == 'transverse_span':
                 output_low, output_high = cfg.xaim_span_range
                 output_activation = 'sigmoid'
             else:
@@ -2305,26 +2391,51 @@ def stage_annual(cfg: Config, df: pd.DataFrame, cluster_data: dict,
                         torch.from_numpy(x_in.astype(np.float32)).to(device),
                         torch.tensor([cluster_id], dtype=torch.long).to(device)
                     ).cpu().numpy()[0]
-                aim = expand_aim_to_full(nn_out, cfg)
-                used_span = float(nn_out[0]) if cfg.aim_mode == 'transverse_span' else float('nan')
+                aim = expand_aim_to_full(nn_out, cfg, geo=geo)
+                if cfg.aim_mode == 'transverse_span' and cfg.experiment_mode == 'grouped_span':
+                    used_span_inner = float(nn_out[0])
+                    used_span_mid = float(nn_out[1])
+                    used_span_outer = float(nn_out[2])
+                    used_span = float(np.mean(nn_out))
+                    used_span_vector = nn_out.tolist()
+                    strategy_param_mode = 'grouped_span'
+                elif cfg.aim_mode == 'transverse_span':
+                    used_span = float(nn_out[0])
+                    used_span_inner = np.nan
+                    used_span_mid = np.nan
+                    used_span_outer = np.nan
+                    used_span_vector = [float(nn_out[0])]
+                    strategy_param_mode = 'span_1d'
+                else:
+                    used_span = float('nan')
+                    used_span_inner = np.nan
+                    used_span_mid = np.nan
+                    used_span_outer = np.nan
+                    used_span_vector = None
+                    strategy_param_mode = 'longitudinal'
                 _, m = mcrt.trace(row['solar_alt'], row['solar_az'], aim, row['DNI'],
                                   n_rays=cfg.n_rays_validate)
                 nn_recs.append({
                     'cluster': int(cluster_id),
-                    'strategy': 'NN_adaptive_span',
+                    'strategy': nn_strategy_name,
                     'eta_opt': float(m['eta_opt']),
                     'sigma_surface': float(m['sigma_surface']),
                     'cv_circ': float(m['cv_circ']),
                     'par_full': float(m['par_full']),
                     'top_flux_ratio': float(m['top_flux_ratio']),
                     'span': used_span,
+                    'span_inner': used_span_inner,
+                    'span_mid': used_span_mid,
+                    'span_outer': used_span_outer,
+                    'span_vector': used_span_vector,
+                    'strategy_param_mode': strategy_param_mode,
                     'source_sample_idx': -1,
                     'distance_to_rep': 0.0,
                     'weight': float(weights[cluster_id]),
                 })
             eta_nn, sig_nn, cv_nn, par_nn, top_nn = _weighted_metrics(nn_recs)
             annual_records.append({
-                'strategy': 'NN_adaptive_span',
+                'strategy': nn_strategy_name,
                 'annual_eta_opt': eta_nn,
                 'annual_sigma_surface': sig_nn,
                 'annual_cv_circ': cv_nn,
@@ -2333,7 +2444,7 @@ def stage_annual(cfg: Config, df: pd.DataFrame, cluster_data: dict,
             })
             annual_detail_records.extend(nn_recs)
         except Exception as e:
-            logger.warn(f"NN 推理失败，跳过 NN_adaptive_span: {e}")
+            logger.warn(f"NN 推理失败，跳过 {nn_strategy_name}: {e}")
 
     annual_df = pd.DataFrame(annual_records)
     out = {
@@ -2386,7 +2497,10 @@ def stage_sensitivity_fixed_span(cfg: Config, df: pd.DataFrame, cluster_data: di
     df_scan['eta_rel_to_s1'] = df_scan['annual_eta_opt'] / (s1['annual_eta_opt'] + 1e-12)
     df_scan['sigma_improve_pct'] = (s1['annual_sigma_surface'] - df_scan['annual_sigma_surface']) / (s1['annual_sigma_surface'] + 1e-12) * 100.0
     df_scan['par_improve_pct'] = (s1['annual_par_full'] - df_scan['annual_par_full']) / (s1['annual_par_full'] + 1e-12) * 100.0
-    df_scan['top_flux_improve_pct'] = (s1['annual_top_flux_ratio'] - df_scan['annual_top_flux_ratio']) / (s1['annual_top_flux_ratio'] + 1e-12) * 100.0
+    df_scan['top_flux_improve_pct'] = (
+        (df_scan['annual_top_flux_ratio'] - s1['annual_top_flux_ratio'])
+        / (s1['annual_top_flux_ratio'] + 1e-12) * 100.0
+    )
     tab_dir = workdir / 'tables'; fig_dir = workdir / 'figures'
     tab_dir.mkdir(exist_ok=True); fig_dir.mkdir(exist_ok=True)
     df_scan.to_csv(tab_dir / 'tab08_fixed_span_scan.csv', index=False)
@@ -2475,13 +2589,17 @@ def make_xaim_pattern(cfg, n=None):
     return np.linspace(-1.0, 1.0, int(n), dtype=float)
 
 
-def make_group_ids(cfg):
-    """按 |mirror_x| 将镜子分成 inner/mid/outer 三组。"""
-    geo = LFRGeometry(cfg)
+def make_group_ids(cfg, geo=None):
+    """
+    按 |mirror_x| 将镜子分成 inner/mid/outer 三组。
+    0 = inner, 1 = mid, 2 = outer
+    """
+    if geo is None:
+        geo = LFRGeometry(cfg)
     idx = np.argsort(np.abs(geo.mirror_x))
     groups = np.zeros(cfg.n_mirrors, dtype=int)
     n = len(idx)
-    groups[idx[n // 3:2 * n // 3]] = 1
+    groups[idx[n // 3: 2 * n // 3]] = 1
     groups[idx[2 * n // 3:]] = 2
     return groups
 
@@ -2506,7 +2624,7 @@ def make_xaim_from_grouped_span(cfg, spans, geo=None):
         raise ValueError(f"grouped_span 需要 3 维输入，当前为 {spans.size}")
     bounds = np.asarray(cfg.grouped_span_bounds, dtype=float)
     spans = np.clip(spans, bounds[:, 0], bounds[:, 1])
-    group_ids = make_group_ids(cfg)
+    group_ids = make_group_ids(cfg, geo=geo)
     pattern = make_xaim_pattern(cfg, cfg.n_mirrors)
     return spans[group_ids] * pattern
 
@@ -2520,32 +2638,42 @@ def make_s1_aim(cfg):
     return np.zeros(cfg.n_mirrors, dtype=float)
 
 
-def expand_aim_to_full(aim, cfg):
+def expand_aim_to_full(aim, cfg, geo=None):
     """
     将策略输出的 aim 向量统一展开成 cfg.n_mirrors 维。
     """
     aim = np.asarray(aim, dtype=np.float64).ravel()
 
     if cfg.aim_mode == 'transverse_span':
-        # aim 可能是 [span]，也可能已经是 full x_aim
+        if getattr(cfg, 'experiment_mode', 'span_1d') == 'grouped_span':
+            if aim.size == 3:
+                return make_xaim_from_grouped_span(cfg, aim, geo=geo)
+            if aim.size == cfg.n_mirrors:
+                return aim
+            raise ValueError(
+                f"grouped_span 模式下 aim 应为 3 维 [inner, mid, outer] 或 "
+                f"{cfg.n_mirrors} 维 full x_aim，当前 len={aim.size}"
+            )
+
         if aim.size == 1:
             return make_xaim_from_span(cfg, float(aim[0]))
         if aim.size == cfg.n_mirrors:
             return aim
         raise ValueError(
-            f"transverse_span 模式下 aim 应为 1 维 span 或 {cfg.n_mirrors} 维 full x_aim，"
-            f"当前 len={aim.size}"
+            f"transverse_span/span_1d 模式下 aim 应为 1 维 span 或 "
+            f"{cfg.n_mirrors} 维 full x_aim，当前 len={aim.size}"
         )
 
-    # 旧版兼容：longitudinal 半场或全场
+    # old longitudinal fallback
     if aim.size == cfg.n_mirrors:
         return aim
     if cfg.n_mirrors % 2 == 0 and aim.size == cfg.n_mirrors // 2:
         return np.concatenate([aim[::-1], aim])
+
     raise ValueError(
         f"aim 向量维度不匹配: len(aim)={aim.size}, "
         f"cfg.n_mirrors={cfg.n_mirrors}, cfg.aim_mode={cfg.aim_mode}, "
-        f"cfg.use_symmetry={cfg.use_symmetry}"
+        f"experiment_mode={getattr(cfg, 'experiment_mode', None)}"
     )
 
 
@@ -2941,7 +3069,7 @@ def export_tonatiuh_all_training_cases(cfg, cluster_data, bo_data, formulas, wor
 
         try:
             raw_aim = _safe_parse_aim_vector(sample['aim_optimal'])
-            full_aim_bo = expand_aim_to_full(raw_aim, cfg)
+            full_aim_bo = expand_aim_to_full(raw_aim, cfg, geo=geo)
         except Exception as e:
             raise ValueError(
                 f"解析/展开 aim_optimal 失败: bo_row_index={bo_row_index}, "
@@ -3110,10 +3238,12 @@ def run_pipeline(cfg: Config, logger: Logger, stop: StopSignal,
     cfg_dict['config_hash'] = cfg_hash
     with open(workdir / 'config_used.json', 'w') as f:
         json.dump(cfg_dict, f, indent=2, ensure_ascii=False)
-    ckpt = Checkpoint(cfg.workdir, config_hash=cfg_hash)
-    ckpt_hash = ckpt.state.get('config_hash')
-    if cfg.config_hash_strict and ckpt_hash and ckpt_hash != cfg_hash and not cfg.force_reuse_cache:
-        raise RuntimeError("checkpoint 配置与当前配置不一致。请清理结果目录或设置 force_reuse_cache=True。")
+    ckpt = Checkpoint(
+        cfg.workdir,
+        config_hash=cfg_hash,
+        strict=cfg.config_hash_strict,
+        force=cfg.force_reuse_cache
+    )
     
     all_stages = ['data', 'cluster', 'baseline', 'bo', 'train', 'distill', 'annual', 'sensitivity', 'export']
     if stages_to_run is None:
@@ -3126,6 +3256,11 @@ def run_pipeline(cfg: Config, logger: Logger, stop: StopSignal,
     df = None; cluster_data = None; baselines = None; bo_data = None
     train_path = None; history = {}; formulas = {}; annual = None; sensitivity = None
     describe_runtime_backend(cfg, logger)
+    if cfg.experiment_mode == 'compare_all':
+        logger.warn(
+            "compare_all 当前仅汇总已有 sensitivity/annual/bo 结果，"
+            "不会自动运行完整 BO_1D 与 BO_grouped 诊断。"
+        )
     runtime_rows = []
     def _mark_runtime(stage_name, t0, t1):
         runtime_rows.append({
