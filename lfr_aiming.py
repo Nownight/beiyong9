@@ -18,6 +18,7 @@ import os
 import sys
 import ast
 import json
+import hashlib
 import pickle
 import threading
 import time
@@ -74,11 +75,8 @@ try:
 except ImportError:
     HAS_PVLIB = False
 
-try:
-    from pysr import PySRRegressor
-    HAS_PYSR = True
-except ImportError:
-    HAS_PYSR = False
+# 延迟导入 PySR，避免启动时触发 JuliaCall
+HAS_PYSR = False
 
 
 def _pick_first_available_font(candidates):
@@ -202,12 +200,22 @@ class Config:
     n_phi_bins: int = 36
     n_z_bins: int = 50
     max_cpc_bounces: int = 10
+    mcrt_backend: str = 'numpy_cpu'  # numpy_cpu / torch_cuda_experimental
+    mcrt_gpu_validate_on_start: bool = True
+    mcrt_gpu_parity_rays: int = 5000
+    mcrt_gpu_parity_tol_eta: float = 0.05
+    mcrt_gpu_parity_tol_sigma: float = 0.08
+    mcrt_num_workers: int = 1
     
     # BO
     bo_n_initial: int = 30
     bo_n_iterations: int = 80
     bo_ref_point: tuple = (0.30, -1.5)  # (eta_opt 最低, -uniformity 最高)
     bo_force_s1_initial: bool = True
+    experiment_mode: str = 'span_1d'  # span_1d / grouped_span / fixed_scan / compare_all
+    fixed_span_values: tuple = (0.0, 0.015, 0.025, 0.035, 0.04)
+    grouped_span_bounds: tuple = ((0.0, 0.025), (0.0, 0.040), (0.0, 0.050))
+    grouped_span_enable_gamma: bool = False
     
     # Transformer
     nn_d_model: int = 128
@@ -219,19 +227,23 @@ class Config:
     nn_val_ratio: float = 0.2
     # NN early stopping
     nn_early_stop_patience: int = 20
-    nn_min_delta: float = 1e-4
+    nn_min_delta: float = 1e-6
     
     # PySR
     pysr_iterations: int = 50
     pysr_population: int = 40
     pysr_maxsize: int = 22
+    enable_pysr: bool = False
     
     # 验证
     full_year_sample: int = 500
+    n_rays_sensitivity: int = 50_000
     
     # 计算
     device: str = 'auto'  # auto/cpu/cuda
     seed: int = 42
+    config_hash_strict: bool = True
+    force_reuse_cache: bool = False
     
     def to_dict(self):
         return asdict(self)
@@ -253,6 +265,43 @@ class Config:
         return self.device
 
 
+def compute_config_hash(cfg: Config) -> str:
+    """仅基于影响结果的核心字段计算配置哈希。"""
+    keys = [
+        'aim_mode', 'xaim_span_range', 'paper_xaim_span', 'bo_uniformity_metric', 'bo_eta_floor_rel',
+        'experiment_mode', 'fixed_span_values', 'grouped_span_bounds',
+        'n_mirrors', 'mirror_length', 'mirror_width', 'field_half_width',
+        'receiver_height', 'cpc_inlet_height', 'cpc_half_angle_deg', 'cpc_inlet_width',
+        'absorber_radius', 'glass_radius',
+        'n_rays_eval', 'n_rays_validate', 'n_phi_bins', 'n_z_bins',
+        'bo_n_initial', 'bo_n_iterations', 'samples_per_cluster', 'n_clusters', 'seed'
+    ]
+    payload = {k: getattr(cfg, k) for k in keys}
+    txt = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(txt.encode('utf-8')).hexdigest()[:12]
+
+
+def _validate_cached_hash(cached_hash: Optional[str], cfg: Config, label: str):
+    cur = compute_config_hash(cfg)
+    if cfg.config_hash_strict and cached_hash and cached_hash != cur and not cfg.force_reuse_cache:
+        raise RuntimeError(f"{label} 缓存配置与当前配置不一致。请清理对应阶段结果，或设置 force_reuse_cache=True。")
+
+
+def _load_pickle_checked(path: Path, cfg: Config, label: str):
+    with open(path, 'rb') as f:
+        obj = pickle.load(f)
+    cached_hash = obj.get('config_hash') if isinstance(obj, dict) else None
+    _validate_cached_hash(cached_hash, cfg, label)
+    return obj
+
+
+def _save_pickle_with_hash(path: Path, payload: dict, cfg: Config):
+    payload = dict(payload)
+    payload['config_hash'] = compute_config_hash(cfg)
+    with open(path, 'wb') as f:
+        pickle.dump(payload, f)
+
+
 # ==================== 断点管理 ====================
 
 class Checkpoint:
@@ -260,11 +309,14 @@ class Checkpoint:
     
     STAGES = ['data', 'cluster', 'baseline', 'bo', 'train', 'distill', 'annual', 'sensitivity']
     
-    def __init__(self, workdir):
+    def __init__(self, workdir, config_hash=None):
         self.workdir = Path(workdir)
         self.workdir.mkdir(parents=True, exist_ok=True)
         self.state_file = self.workdir / 'checkpoint.json'
         self.state = self._load()
+        self.config_hash = config_hash
+        if config_hash is not None:
+            self.ensure_hash(config_hash)
     
     def _load(self):
         if self.state_file.exists():
@@ -275,6 +327,15 @@ class Checkpoint:
     def save(self):
         with open(self.state_file, 'w') as f:
             json.dump(self.state, f, indent=2, default=str)
+
+    def ensure_hash(self, config_hash):
+        cached = self.state.get('config_hash')
+        if cached is None:
+            self.state['config_hash'] = config_hash
+            self.save()
+            return
+        if cached != config_hash:
+            self.state['config_hash'] = cached
     
     def is_done(self, stage):
         return stage in self.state['completed']
@@ -1251,6 +1312,55 @@ class MCRTTracer:
                 'q_mean_full': float(q_mean_full)}
 
 
+class MCRTTracerTorch(MCRTTracer):
+    """实验性 CUDA 后端（当前版本仍复用 CPU 路径，保持结果一致性）。"""
+    def trace(self, sun_alt_deg, sun_az_deg, aim_z, dni, n_rays=None):
+        if self.cfg.aim_mode != 'transverse_span':
+            raise NotImplementedError("MCRTTracerTorch 目前仅支持 transverse_span。")
+        return super().trace(sun_alt_deg, sun_az_deg, aim_z, dni, n_rays=n_rays)
+
+
+def create_mcrt_tracer(cfg, geo, logger=None):
+    if cfg.mcrt_backend == 'torch_cuda_experimental':
+        if HAS_TORCH and torch.cuda.is_available():
+            return MCRTTracerTorch(cfg, geo)
+        if logger:
+            logger.warn("请求 torch_cuda_experimental，但 CUDA 不可用，自动回退到 numpy_cpu")
+        cfg.mcrt_backend = 'numpy_cpu'
+    return MCRTTracer(cfg, geo)
+
+
+def describe_runtime_backend(cfg, logger):
+    nn_device = cfg.get_device()
+    logger.info(f"NN device: {nn_device}")
+    logger.info(f"MCRT backend: {cfg.mcrt_backend}")
+    if cfg.mcrt_backend == 'numpy_cpu':
+        logger.warn("当前 MCRT 光追为 NumPy CPU 实现，GPU 只用于 Transformer，不会加速 MCRT。")
+
+
+def validate_mcrt_backend_parity(cfg, cluster_data, logger):
+    if cfg.mcrt_backend != 'torch_cuda_experimental' or not cfg.mcrt_gpu_validate_on_start:
+        return
+    if not (HAS_TORCH and torch.cuda.is_available()):
+        cfg.mcrt_backend = 'numpy_cpu'
+        return
+    rep = cluster_data['representatives'].iloc[0]
+    row = cluster_data['df'].iloc[int(rep['rep_idx'])]
+    geo = LFRGeometry(cfg)
+    cpu = MCRTTracer(cfg, geo)
+    gpu = MCRTTracerTorch(cfg, geo)
+    for span in (0.0, 0.035):
+        aim = make_xaim_from_span(cfg, span)
+        _, mc = cpu.trace(row['solar_alt'], row['solar_az'], aim, row['DNI'], n_rays=cfg.mcrt_gpu_parity_rays)
+        _, mg = gpu.trace(row['solar_alt'], row['solar_az'], aim, row['DNI'], n_rays=cfg.mcrt_gpu_parity_rays)
+        de = abs(mg['eta_opt'] - mc['eta_opt'])
+        ds = abs(mg['sigma_surface'] - mc['sigma_surface'])
+        if de > cfg.mcrt_gpu_parity_tol_eta or ds > cfg.mcrt_gpu_parity_tol_sigma:
+            logger.warn("GPU MCRT 与 CPU 差异过大，回退 numpy_cpu")
+            cfg.mcrt_backend = 'numpy_cpu'
+            return
+
+
 # ==================== 5. 基线策略 ====================
 
 def stage_baseline(cfg: Config, cluster_data: dict, logger: Logger,
@@ -1262,11 +1372,10 @@ def stage_baseline(cfg: Config, cluster_data: dict, logger: Logger,
 
     if ckpt.is_done('baseline') and out_path.exists():
         logger.info("已完成,加载基线结果")
-        with open(out_path, 'rb') as f:
-            return pickle.load(f)
+        return _load_pickle_checked(out_path, cfg, 'baselines.pkl')
 
     geo = LFRGeometry(cfg)
-    mcrt = MCRTTracer(cfg, geo)
+    mcrt = create_mcrt_tracer(cfg, geo, logger)
 
     rep_df = cluster_data['representatives']
     df = cluster_data['df']
@@ -1309,8 +1418,7 @@ def stage_baseline(cfg: Config, cluster_data: dict, logger: Logger,
 
     res_df = pd.DataFrame(results)
     out = {'results': res_df, 'flux_maps': flux_maps}
-    with open(out_path, 'wb') as f:
-        pickle.dump(out, f)
+    _save_pickle_with_hash(out_path, out, cfg)
     ckpt.mark_done('baseline')
     s1 = res_df[res_df.strategy == 'S1_center']
     logger.info(
@@ -1512,19 +1620,22 @@ def stage_bo(cfg: Config, df: pd.DataFrame, cluster_data: dict,
 
     if ckpt.is_done('bo') and out_path.exists():
         logger.info("已完成,加载 BO 数据集")
-        with open(out_path, 'rb') as f:
-            return pickle.load(f)
+        return _load_pickle_checked(out_path, cfg, 'bo_dataset.pkl')
 
     geo = LFRGeometry(cfg)
-    mcrt = MCRTTracer(cfg, geo)
+    mcrt = create_mcrt_tracer(cfg, geo, logger)
 
     rep_df = cluster_data['representatives']
     df_full = cluster_data['df']
 
     # 决策变量维度
     if cfg.aim_mode == 'transverse_span':
-        dim = 1
-        bounds = [cfg.xaim_span_range]
+        if cfg.experiment_mode == 'grouped_span':
+            dim = 3
+            bounds = list(cfg.grouped_span_bounds)
+        else:
+            dim = 1
+            bounds = [cfg.xaim_span_range]
     else:
         dim = cfg.n_mirrors // 2 if cfg.use_symmetry else cfg.n_mirrors
         bounds = [cfg.z_range] * dim
@@ -1563,8 +1674,12 @@ def stage_bo(cfg: Config, df: pd.DataFrame, cluster_data: dict,
 
             def eval_fn(x, _hr=hour_row):
                 if cfg.aim_mode == 'transverse_span':
-                    span = float(np.asarray(x).ravel()[0])
-                    aim = make_xaim_from_span(cfg, span)
+                    if cfg.experiment_mode == 'grouped_span':
+                        spans = np.asarray(x).ravel()
+                        aim = make_xaim_from_grouped_span(cfg, spans, geo)
+                    else:
+                        span = float(np.asarray(x).ravel()[0])
+                        aim = make_xaim_from_span(cfg, span)
                 else:
                     if cfg.use_symmetry:
                         aim = np.concatenate([x[::-1], x])
@@ -1579,7 +1694,10 @@ def stage_bo(cfg: Config, df: pd.DataFrame, cluster_data: dict,
                             n_iter=cfg.bo_n_iterations, seed=cfg.seed + ci * 100 + si)
 
             # 初始点
-            if cfg.aim_mode == 'transverse_span':
+            if cfg.aim_mode == 'transverse_span' and cfg.experiment_mode == 'grouped_span':
+                x_s1 = np.array([0.0, 0.0, 0.0])
+                initial_points = [[0.0, 0.0, 0.0], [0.035, 0.035, 0.035], [0.015, 0.025, 0.035], [0.005, 0.025, 0.045]]
+            elif cfg.aim_mode == 'transverse_span':
                 x_s1 = np.array([0.0])
                 initial_points = []
                 if cfg.bo_force_s1_initial:
@@ -1601,12 +1719,19 @@ def stage_bo(cfg: Config, df: pd.DataFrame, cluster_data: dict,
             )
 
             # 获取完整 metrics（对 selected_x 再调用一次 trace）
-            if cfg.aim_mode == 'transverse_span':
+            if cfg.aim_mode == 'transverse_span' and cfg.experiment_mode == 'grouped_span':
+                spans = np.asarray(selected_x).ravel()
+                sel_span = float(np.mean(spans))
+                sel_aim = make_xaim_from_grouped_span(cfg, spans, geo)
+                s1_aim = make_xaim_from_span(cfg, 0.0)
+            elif cfg.aim_mode == 'transverse_span':
                 sel_span = float(selected_x.ravel()[0])
+                spans = np.array([sel_span], dtype=float)
                 sel_aim = make_xaim_from_span(cfg, sel_span)
                 s1_aim = make_xaim_from_span(cfg, 0.0)
             else:
                 sel_span = float('nan')
+                spans = np.array([], dtype=float)
                 sel_aim = expand_aim_to_full(selected_x, cfg)
                 s1_aim = np.zeros(cfg.n_mirrors)
 
@@ -1631,6 +1756,11 @@ def stage_bo(cfg: Config, df: pd.DataFrame, cluster_data: dict,
                 'cv_circ': float(selected_metrics['cv_circ']),
                 'aim_mode': cfg.aim_mode,
                 'span_optimal': sel_span,
+                'span_vector': spans.tolist(),
+                'strategy_param_mode': 'grouped_span' if (cfg.aim_mode == 'transverse_span' and cfg.experiment_mode == 'grouped_span') else 'span_1d',
+                'span_inner': float(spans[0]) if len(spans) >= 3 else float('nan'),
+                'span_mid': float(spans[1]) if len(spans) >= 3 else float('nan'),
+                'span_outer': float(spans[2]) if len(spans) >= 3 else float('nan'),
                 'xaim_min': float(-sel_span) if cfg.aim_mode == 'transverse_span' else float('nan'),
                 'xaim_max': float(sel_span) if cfg.aim_mode == 'transverse_span' else float('nan'),
                 'uniformity_metric': uniformity_key,
@@ -1664,8 +1794,7 @@ def stage_bo(cfg: Config, df: pd.DataFrame, cluster_data: dict,
             )
 
     out = {'samples': pd.DataFrame(samples), 'pareto_data': pareto_data, 'dim': dim}
-    with open(out_path, 'wb') as f:
-        pickle.dump(out, f)
+    _save_pickle_with_hash(out_path, out, cfg)
     if partial_path.exists():
         partial_path.unlink()
     ckpt.mark_done('bo')
@@ -1724,8 +1853,12 @@ def stage_train(cfg: Config, bo_data: dict, logger: Logger,
     workdir = Path(cfg.workdir)
     out_path = workdir / 'transformer.pt'
     history_path = workdir / 'train_history.json'
+    model_meta_path = workdir / 'model_meta.json'
     
     if ckpt.is_done('train') and out_path.exists():
+        if model_meta_path.exists():
+            meta = json.load(open(model_meta_path))
+            _validate_cached_hash(meta.get('config_hash'), cfg, 'model_meta.json')
         logger.info("已完成,加载模型")
         return out_path, json.load(open(history_path))
     
@@ -1870,6 +2003,8 @@ def stage_train(cfg: Config, bo_data: dict, logger: Logger,
     history['best_val'] = float(best_val)
     with open(history_path, 'w') as f:
         json.dump(history, f, indent=2)
+    with open(model_meta_path, 'w') as f:
+        json.dump({'config_hash': compute_config_hash(cfg), 'dim': int(dim), 'aim_mode': cfg.aim_mode}, f, indent=2)
     
     ckpt.mark_done('train')
     return out_path, history
@@ -1913,7 +2048,15 @@ def stage_distill(cfg: Config, bo_data: dict, train_path: Path,
             return 'span'
         return f'z_{i+1}'
 
-    if not HAS_PYSR:
+    HAS_PYSR_LOCAL = False
+    if cfg.enable_pysr:
+        try:
+            from pysr import PySRRegressor
+            HAS_PYSR_LOCAL = True
+        except ImportError:
+            HAS_PYSR_LOCAL = False
+
+    if not HAS_PYSR_LOCAL:
         logger.warn("PySR 未安装,使用多项式回归代替")
         from sklearn.preprocessing import PolynomialFeatures
         from sklearn.linear_model import Ridge
@@ -1989,15 +2132,14 @@ def stage_annual(cfg: Config, df: pd.DataFrame, cluster_data: dict,
     out_path = workdir / 'annual.pkl'
 
     if ckpt.is_done('annual') and out_path.exists():
-        with open(out_path, 'rb') as f:
-            return pickle.load(f)
+        return _load_pickle_checked(out_path, cfg, 'annual.pkl')
 
     rep_df = cluster_data['representatives']
     weights = rep_df.set_index('cluster')['weight'].to_dict()
     base_df = baselines['results']
 
     geo = LFRGeometry(cfg)
-    mcrt = MCRTTracer(cfg, geo)
+    mcrt = create_mcrt_tracer(cfg, geo, logger)
 
     annual_records = []
     annual_detail_records = []
@@ -2199,8 +2341,7 @@ def stage_annual(cfg: Config, df: pd.DataFrame, cluster_data: dict,
         'annual_details': pd.DataFrame(annual_detail_records),
         'baselines': baselines
     }
-    with open(out_path, 'wb') as f:
-        pickle.dump(out, f)
+    _save_pickle_with_hash(out_path, out, cfg)
     ckpt.mark_done('annual')
 
     logger.info("年度对比:")
@@ -2214,6 +2355,100 @@ def stage_annual(cfg: Config, df: pd.DataFrame, cluster_data: dict,
 
 
 # ==================== 10. 图表导出 ====================
+
+def stage_sensitivity_fixed_span(cfg: Config, df: pd.DataFrame, cluster_data: dict,
+                                 logger: Logger, stop: StopSignal, ckpt: Checkpoint):
+    logger.info("=== 阶段: 固定 span 敏感性扫描 ===")
+    workdir = Path(cfg.workdir)
+    out_path = workdir / 'sensitivity_fixed_span.pkl'
+    if ckpt.is_done('sensitivity') and out_path.exists():
+        return _load_pickle_checked(out_path, cfg, 'sensitivity_fixed_span.pkl')
+    geo = LFRGeometry(cfg)
+    mcrt = create_mcrt_tracer(cfg, geo, logger)
+    reps = cluster_data['representatives']
+    cdf = cluster_data['df']
+    weights = reps.set_index('cluster')['weight'].to_dict()
+    rows = []
+    for span in cfg.fixed_span_values:
+        acc = {'eta': 0.0, 'sigma': 0.0, 'cv': 0.0, 'par': 0.0, 'top': 0.0}
+        for _, rep in reps.iterrows():
+            stop.check()
+            row = cdf.iloc[int(rep['rep_idx'])]
+            _, m = mcrt.trace(row['solar_alt'], row['solar_az'], make_xaim_from_span(cfg, span),
+                              row['DNI'], n_rays=cfg.n_rays_sensitivity)
+            w = weights[int(rep['cluster'])]
+            acc['eta'] += w * m['eta_opt']; acc['sigma'] += w * m['sigma_surface']
+            acc['cv'] += w * m['cv_circ']; acc['par'] += w * m['par_full']; acc['top'] += w * m['top_flux_ratio']
+        rows.append({'span': float(span), 'annual_eta_opt': acc['eta'], 'annual_sigma_surface': acc['sigma'],
+                     'annual_cv_circ': acc['cv'], 'annual_par_full': acc['par'], 'annual_top_flux_ratio': acc['top']})
+    df_scan = pd.DataFrame(rows).sort_values('span').reset_index(drop=True)
+    s1 = df_scan[df_scan['span'] == 0.0].iloc[0]
+    df_scan['eta_rel_to_s1'] = df_scan['annual_eta_opt'] / (s1['annual_eta_opt'] + 1e-12)
+    df_scan['sigma_improve_pct'] = (s1['annual_sigma_surface'] - df_scan['annual_sigma_surface']) / (s1['annual_sigma_surface'] + 1e-12) * 100.0
+    df_scan['par_improve_pct'] = (s1['annual_par_full'] - df_scan['annual_par_full']) / (s1['annual_par_full'] + 1e-12) * 100.0
+    df_scan['top_flux_improve_pct'] = (s1['annual_top_flux_ratio'] - df_scan['annual_top_flux_ratio']) / (s1['annual_top_flux_ratio'] + 1e-12) * 100.0
+    tab_dir = workdir / 'tables'; fig_dir = workdir / 'figures'
+    tab_dir.mkdir(exist_ok=True); fig_dir.mkdir(exist_ok=True)
+    df_scan.to_csv(tab_dir / 'tab08_fixed_span_scan.csv', index=False)
+    def draw_fig13(lang):
+        fig, ax1 = plt.subplots(figsize=(8, 5))
+        ax2 = ax1.twinx()
+        ax1.plot(df_scan['span'], df_scan['annual_eta_opt'], marker='o', color='tab:blue')
+        ax2.plot(df_scan['span'], df_scan['annual_sigma_surface'], marker='s', color='tab:red')
+        ax1.axvline(0.035, color='gray', linestyle='--', alpha=0.6)
+        ax1.set_xlabel('span (m)'); ax1.set_ylabel('annual_eta_opt'); ax2.set_ylabel('annual_sigma_surface')
+        ax1.set_title('图13 固定 span 扫描' if lang == 'zh' else 'Fig. 13 Fixed-span scan')
+        return fig
+    save_bilingual_figure(fig_dir / 'fig13_fixed_span_scan.png', draw_fig13)
+    out = {'scan': df_scan}
+    _save_pickle_with_hash(out_path, out, cfg)
+    ckpt.mark_done('sensitivity')
+    return out
+
+
+def export_strategy_screening_table(cfg: Config, annual: Optional[dict], bo_data: Optional[dict], sensitivity: Optional[dict]):
+    if cfg.experiment_mode != 'compare_all':
+        return
+    workdir = Path(cfg.workdir)
+    tab_dir = workdir / 'tables'
+    tab_dir.mkdir(exist_ok=True)
+    rows = []
+    if sensitivity and 'scan' in sensitivity:
+        scan = sensitivity['scan']
+        for s in [0.0, 0.015, 0.025, 0.035, 0.04]:
+            sub = scan[np.isclose(scan['span'], s)]
+            if len(sub) == 0:
+                continue
+            r = sub.iloc[0]
+            rows.append({'strategy': 'S1_center' if s == 0 else f'S_fixed_span_{str(s).replace(".", "")}',
+                         'annual_eta_opt': r['annual_eta_opt'], 'annual_sigma_surface': r['annual_sigma_surface'],
+                         'annual_par_full': r['annual_par_full'], 'annual_top_flux_ratio': r['annual_top_flux_ratio'],
+                         'eta_rel_to_s1': r['eta_rel_to_s1'], 'sigma_improve_pct': r['sigma_improve_pct'],
+                         'par_improve_pct': r['par_improve_pct'], 'top_flux_improve_pct': r['top_flux_improve_pct'],
+                         'runtime_minutes': np.nan})
+    if annual and 'annual_summary' in annual:
+        adf = annual['annual_summary']
+        s1 = adf[adf['strategy'] == 'S1_center'].iloc[0] if len(adf[adf['strategy'] == 'S1_center']) else None
+        for _, r in adf.iterrows():
+            if r['strategy'] == 'S1_center':
+                continue
+            rows.append({'strategy': r['strategy'], 'annual_eta_opt': r['annual_eta_opt'],
+                         'annual_sigma_surface': r.get('annual_sigma_surface', np.nan),
+                         'annual_par_full': r.get('annual_par_full', np.nan),
+                         'annual_top_flux_ratio': r.get('annual_top_flux_ratio', np.nan),
+                         'eta_rel_to_s1': (r['annual_eta_opt'] / s1['annual_eta_opt']) if s1 is not None else np.nan,
+                         'sigma_improve_pct': ((s1.get('annual_sigma_surface', np.nan) - r.get('annual_sigma_surface', np.nan)) / (s1.get('annual_sigma_surface', np.nan) + 1e-12) * 100.0) if s1 is not None else np.nan,
+                         'par_improve_pct': np.nan, 'top_flux_improve_pct': np.nan, 'runtime_minutes': np.nan})
+    if rows:
+        out = pd.DataFrame(rows)
+        def _rec(rr):
+            if rr['eta_rel_to_s1'] >= 0.96 and rr['sigma_improve_pct'] >= 5:
+                return 'promising_main_strategy'
+            if rr['eta_rel_to_s1'] >= 0.96 and rr['sigma_improve_pct'] > 0:
+                return 'mild_improvement'
+            return 'not_recommended'
+        out['recommendation'] = out.apply(_rec, axis=1)
+        out.to_csv(tab_dir / 'tab09_strategy_screening.csv', index=False)
 
 def _safe_parse_aim_vector(raw_aim):
     """将 aim_optimal 安全解析为一维 numpy 向量"""
@@ -2240,6 +2475,17 @@ def make_xaim_pattern(cfg, n=None):
     return np.linspace(-1.0, 1.0, int(n), dtype=float)
 
 
+def make_group_ids(cfg):
+    """按 |mirror_x| 将镜子分成 inner/mid/outer 三组。"""
+    geo = LFRGeometry(cfg)
+    idx = np.argsort(np.abs(geo.mirror_x))
+    groups = np.zeros(cfg.n_mirrors, dtype=int)
+    n = len(idx)
+    groups[idx[n // 3:2 * n // 3]] = 1
+    groups[idx[2 * n // 3:]] = 2
+    return groups
+
+
 def make_xaim_from_span(cfg, span):
     """
     根据 BO 搜索到的 span 生成每面镜的横截面瞄准点 x_aim。
@@ -2252,6 +2498,17 @@ def make_xaim_from_span(cfg, span):
     lo, hi = cfg.xaim_span_range
     span = float(np.clip(span, lo, hi))
     return span * make_xaim_pattern(cfg, cfg.n_mirrors)
+
+
+def make_xaim_from_grouped_span(cfg, spans, geo=None):
+    spans = np.asarray(spans, dtype=float).ravel()
+    if spans.size != 3:
+        raise ValueError(f"grouped_span 需要 3 维输入，当前为 {spans.size}")
+    bounds = np.asarray(cfg.grouped_span_bounds, dtype=float)
+    spans = np.clip(spans, bounds[:, 0], bounds[:, 1])
+    group_ids = make_group_ids(cfg)
+    pattern = make_xaim_pattern(cfg, cfg.n_mirrors)
+    return spans[group_ids] * pattern
 
 
 def make_s1_aim(cfg):
@@ -2848,41 +3105,70 @@ def run_pipeline(cfg: Config, logger: Logger, stop: StopSignal,
     """主流程"""
     workdir = Path(cfg.workdir)
     workdir.mkdir(parents=True, exist_ok=True)
-    cfg.save(workdir / 'config_used.json')
-    ckpt = Checkpoint(cfg.workdir)
+    cfg_hash = compute_config_hash(cfg)
+    cfg_dict = cfg.to_dict()
+    cfg_dict['config_hash'] = cfg_hash
+    with open(workdir / 'config_used.json', 'w') as f:
+        json.dump(cfg_dict, f, indent=2, ensure_ascii=False)
+    ckpt = Checkpoint(cfg.workdir, config_hash=cfg_hash)
+    ckpt_hash = ckpt.state.get('config_hash')
+    if cfg.config_hash_strict and ckpt_hash and ckpt_hash != cfg_hash and not cfg.force_reuse_cache:
+        raise RuntimeError("checkpoint 配置与当前配置不一致。请清理结果目录或设置 force_reuse_cache=True。")
     
+    all_stages = ['data', 'cluster', 'baseline', 'bo', 'train', 'distill', 'annual', 'sensitivity', 'export']
     if stages_to_run is None:
-        stages_to_run = ['data', 'cluster', 'baseline', 'bo', 'train', 'distill', 'annual', 'export']
+        stages_to_run = all_stages
     
     np.random.seed(cfg.seed)
     if HAS_TORCH:
         torch.manual_seed(cfg.seed)
     
     df = None; cluster_data = None; baselines = None; bo_data = None
-    train_path = None; history = {}; formulas = {}; annual = None
+    train_path = None; history = {}; formulas = {}; annual = None; sensitivity = None
+    describe_runtime_backend(cfg, logger)
+    runtime_rows = []
+    def _mark_runtime(stage_name, t0, t1):
+        runtime_rows.append({
+            'stage': stage_name,
+            'start_time': datetime.fromtimestamp(t0).isoformat(),
+            'end_time': datetime.fromtimestamp(t1).isoformat(),
+            'runtime_seconds': t1 - t0,
+            'mcrt_backend': cfg.mcrt_backend,
+            'experiment_mode': cfg.experiment_mode,
+            'n_rays_eval': cfg.n_rays_eval,
+            'n_rays_validate': cfg.n_rays_validate,
+        })
     
     try:
         if 'data' in stages_to_run:
+            _t0 = time.time()
             logger.stage('data', 0)
             df = stage_data(cfg, logger, stop, ckpt)
             logger.stage('data', 1)
+            _mark_runtime('data', _t0, time.time())
         
         if 'cluster' in stages_to_run:
+            _t0 = time.time()
             if df is None:
                 df = pd.read_pickle(workdir / 'tmy_processed.pkl')
             logger.stage('cluster', 0)
             cluster_data = stage_cluster(cfg, df, logger, stop, ckpt)
             logger.stage('cluster', 1)
+            _mark_runtime('cluster', _t0, time.time())
         
         if 'baseline' in stages_to_run:
+            _t0 = time.time()
             if cluster_data is None:
                 with open(workdir / 'clusters.pkl', 'rb') as f:
                     cluster_data = pickle.load(f)
+            validate_mcrt_backend_parity(cfg, cluster_data, logger)
             logger.stage('baseline', 0)
             baselines = stage_baseline(cfg, cluster_data, logger, stop, ckpt)
             logger.stage('baseline', 1)
+            _mark_runtime('baseline', _t0, time.time())
         
         if 'bo' in stages_to_run:
+            _t0 = time.time()
             if df is None:
                 df = pd.read_pickle(workdir / 'tmy_processed.pkl')
             if cluster_data is None:
@@ -2891,37 +3177,39 @@ def run_pipeline(cfg: Config, logger: Logger, stop: StopSignal,
             logger.stage('bo', 0)
             bo_data = stage_bo(cfg, df, cluster_data, logger, stop, ckpt)
             logger.stage('bo', 1)
+            _mark_runtime('bo', _t0, time.time())
         
         if 'train' in stages_to_run:
+            _t0 = time.time()
             if bo_data is None:
-                with open(workdir / 'bo_dataset.pkl', 'rb') as f:
-                    bo_data = pickle.load(f)
+                bo_data = _load_pickle_checked(workdir / 'bo_dataset.pkl', cfg, 'bo_dataset.pkl')
             logger.stage('train', 0)
             train_path, history = stage_train(cfg, bo_data, logger, stop, ckpt)
             logger.stage('train', 1)
+            _mark_runtime('train', _t0, time.time())
         
         if 'distill' in stages_to_run:
+            _t0 = time.time()
             if bo_data is None:
-                with open(workdir / 'bo_dataset.pkl', 'rb') as f:
-                    bo_data = pickle.load(f)
+                bo_data = _load_pickle_checked(workdir / 'bo_dataset.pkl', cfg, 'bo_dataset.pkl')
             if train_path is None:
                 train_path = workdir / 'transformer.pt'
             logger.stage('distill', 0)
             formulas = stage_distill(cfg, bo_data, train_path, logger, stop, ckpt)
             logger.stage('distill', 1)
+            _mark_runtime('distill', _t0, time.time())
         
         if 'annual' in stages_to_run:
+            _t0 = time.time()
             if df is None:
                 df = pd.read_pickle(workdir / 'tmy_processed.pkl')
             if cluster_data is None:
                 with open(workdir / 'clusters.pkl', 'rb') as f:
                     cluster_data = pickle.load(f)
             if baselines is None:
-                with open(workdir / 'baselines.pkl', 'rb') as f:
-                    baselines = pickle.load(f)
+                baselines = _load_pickle_checked(workdir / 'baselines.pkl', cfg, 'baselines.pkl')
             if bo_data is None:
-                with open(workdir / 'bo_dataset.pkl', 'rb') as f:
-                    bo_data = pickle.load(f)
+                bo_data = _load_pickle_checked(workdir / 'bo_dataset.pkl', cfg, 'bo_dataset.pkl')
             if not formulas and (workdir / 'formulas.json').exists():
                 formulas = json.load(open(workdir / 'formulas.json'))
             if train_path is None:
@@ -2930,17 +3218,29 @@ def run_pipeline(cfg: Config, logger: Logger, stop: StopSignal,
             annual = stage_annual(cfg, df, cluster_data, bo_data, train_path,
                                   formulas, baselines, logger, stop, ckpt)
             logger.stage('annual', 1)
+            _mark_runtime('annual', _t0, time.time())
         
+        if 'sensitivity' in stages_to_run:
+            _t0 = time.time()
+            if df is None:
+                df = pd.read_pickle(workdir / 'tmy_processed.pkl')
+            if cluster_data is None:
+                with open(workdir / 'clusters.pkl', 'rb') as f:
+                    cluster_data = pickle.load(f)
+            logger.stage('sensitivity', 0)
+            sensitivity = stage_sensitivity_fixed_span(cfg, df, cluster_data, logger, stop, ckpt)
+            logger.stage('sensitivity', 1)
+            _mark_runtime('sensitivity', _t0, time.time())
+
         if 'export' in stages_to_run:
+            _t0 = time.time()
             if cluster_data is None:
                 with open(workdir / 'clusters.pkl', 'rb') as f:
                     cluster_data = pickle.load(f)
             if baselines is None:
-                with open(workdir / 'baselines.pkl', 'rb') as f:
-                    baselines = pickle.load(f)
+                baselines = _load_pickle_checked(workdir / 'baselines.pkl', cfg, 'baselines.pkl')
             if bo_data is None:
-                with open(workdir / 'bo_dataset.pkl', 'rb') as f:
-                    bo_data = pickle.load(f)
+                bo_data = _load_pickle_checked(workdir / 'bo_dataset.pkl', cfg, 'bo_dataset.pkl')
             if df is None:
                 df = pd.read_pickle(workdir / 'tmy_processed.pkl')
             if not history and (workdir / 'train_history.json').exists():
@@ -2948,10 +3248,18 @@ def run_pipeline(cfg: Config, logger: Logger, stop: StopSignal,
             if not formulas and (workdir / 'formulas.json').exists():
                 formulas = json.load(open(workdir / 'formulas.json'))
             if annual is None and (workdir / 'annual.pkl').exists():
-                with open(workdir / 'annual.pkl', 'rb') as f:
-                    annual = pickle.load(f)
+                annual = _load_pickle_checked(workdir / 'annual.pkl', cfg, 'annual.pkl')
+            if sensitivity is None and (workdir / 'sensitivity_fixed_span.pkl').exists():
+                sensitivity = _load_pickle_checked(workdir / 'sensitivity_fixed_span.pkl', cfg, 'sensitivity_fixed_span.pkl')
             export_figures_and_tables(cfg, df, cluster_data, baselines, bo_data,
                                       history, formulas, annual, logger)
+            export_strategy_screening_table(cfg, annual, bo_data, sensitivity)
+            _mark_runtime('export', _t0, time.time())
+
+        if runtime_rows:
+            tab_dir = workdir / 'tables'
+            tab_dir.mkdir(exist_ok=True)
+            pd.DataFrame(runtime_rows).to_csv(tab_dir / 'tab00_runtime_summary.csv', index=False)
         
         logger.info("=" * 50)
         logger.info("✓ 全流程完成!")
@@ -3003,17 +3311,26 @@ class LFRGui:
         self._build_config_panel(cfg_frame)
         
         # 阶段勾选
-        stage_frame = ttk.LabelFrame(self.root, text='运行阶段(留空=全跑)', padding=10)
+        stage_frame = ttk.LabelFrame(self.root, text='运行阶段选择（勾选=运行；全不选=按断点自动继续）', padding=10)
         stage_frame.pack(fill='x', padx=10, pady=5)
         self.stage_vars = {}
-        stages = [('data', '1.数据'), ('cluster', '2.聚类'), ('baseline', '3.基线'),
-                  ('bo', '4.贝叶斯优化'), ('train', '5.训练 NN'),
-                  ('distill', '6.符号蒸馏'), ('annual', '7.年度合成'),
-                  ('export', '8.导出图表')]
+        stages = [('data', '数据 data'), ('cluster', '聚类 cluster'), ('baseline', '基线 baseline'),
+                  ('bo', 'BO 优化 bo'), ('train', '训练 train'),
+                  ('distill', '蒸馏 distill'), ('annual', '年度 annual'),
+                  ('sensitivity', '敏感性 sensitivity'), ('export', '导出 export')]
         for i, (s, label) in enumerate(stages):
             v = tk.BooleanVar(value=True)
             self.stage_vars[s] = v
-            ttk.Checkbutton(stage_frame, text=label, variable=v).grid(row=0, column=i, padx=5)
+            ttk.Checkbutton(stage_frame, text=label, variable=v).grid(row=i // 5, column=i % 5, padx=5, sticky='w')
+        ttk.Label(stage_frame, text='说明：复选框被选中表示“运行该阶段”；未选中表示“跳过该阶段”。若全部未选，将按 checkpoint 自动继续未完成阶段。').grid(row=2, column=0, columnspan=5, sticky='w', pady=4)
+        quick = ttk.Frame(stage_frame)
+        quick.grid(row=3, column=0, columnspan=5, sticky='w')
+        ttk.Button(quick, text='全部运行', command=self._select_all_stages).pack(side='left', padx=3)
+        ttk.Button(quick, text='清空选择', command=self._clear_all_stages).pack(side='left', padx=3)
+        ttk.Button(quick, text='仅导出图表', command=lambda: self._set_stage_preset(['export'])).pack(side='left', padx=3)
+        ttk.Button(quick, text='仅年度+导出', command=lambda: self._set_stage_preset(['annual', 'export'])).pack(side='left', padx=3)
+        ttk.Button(quick, text='仅敏感性扫描', command=lambda: self._set_stage_preset(['sensitivity'])).pack(side='left', padx=3)
+        ttk.Button(quick, text='从断点继续', command=self._resume_from_checkpoint).pack(side='left', padx=3)
         
         # 控制按钮
         ctrl = ttk.Frame(self.root, padding=10)
@@ -3040,7 +3357,7 @@ class LFRGui:
         ttk.Label(prog_frame, text='整体进度:').grid(row=1, column=0, sticky='w', pady=5)
         self.total_pb = ttk.Progressbar(prog_frame, length=600, mode='determinate', maximum=len(self.stage_vars))
         self.total_pb.grid(row=1, column=2, padx=10, pady=5)
-        self.total_pct = ttk.Label(prog_frame, text='0/8')
+        self.total_pct = ttk.Label(prog_frame, text='0/9')
         self.total_pct.grid(row=1, column=3)
         
         self.status_label = ttk.Label(prog_frame, text='就绪', foreground='blue')
@@ -3070,6 +3387,11 @@ class LFRGui:
             ('BO 迭代数', 'bo_n_iterations', 80, int),
             ('NN epoch', 'nn_epochs', 200, int),
             ('MCRT 光线数', 'n_rays_eval', 50000, int),
+            ('MCRT backend', 'mcrt_backend', 'numpy_cpu', str),
+            ('MCRT workers', 'mcrt_num_workers', 1, int),
+            ('NN device', 'device', 'auto', str),
+            ('PySR 启用', 'enable_pysr', False, bool),
+            ('Experiment mode', 'experiment_mode', 'span_1d', str),
             ('启用对称', 'use_symmetry', True, bool),
         ]
         self.cfg_vars = {}
@@ -3086,9 +3408,25 @@ class LFRGui:
     
     def _dependency_status(self):
         deps = [('numpy/pandas/sklearn', HAS_SKLEARN), ('PyTorch', HAS_TORCH),
-                ('pvlib', HAS_PVLIB), ('PySR', HAS_PYSR)]
+                ('pvlib', HAS_PVLIB)]
         s = ' | '.join(f"{n}:{'✓' if ok else '✗'}" for n, ok in deps)
-        return f"依赖: {s}"
+        return f"依赖: {s} | PySR:按需加载"
+
+    def _select_all_stages(self):
+        for v in self.stage_vars.values():
+            v.set(True)
+
+    def _clear_all_stages(self):
+        for v in self.stage_vars.values():
+            v.set(False)
+
+    def _set_stage_preset(self, enabled):
+        for k, v in self.stage_vars.items():
+            v.set(k in set(enabled))
+
+    def _resume_from_checkpoint(self):
+        self._clear_all_stages()
+        self.start(resume_mode=True)
     
     def _pick_workdir(self):
         d = filedialog.askdirectory(initialdir=self.workdir_var.get())
@@ -3112,7 +3450,7 @@ class LFRGui:
                 return False
         return True
     
-    def start(self):
+    def start(self, resume_mode=False):
         if self.worker is not None and self.worker.is_alive():
             messagebox.showwarning('提示', '已有任务在运行')
             return
@@ -3124,7 +3462,13 @@ class LFRGui:
         
         stages = [s for s, v in self.stage_vars.items() if v.get()]
         if not stages:
-            stages = list(self.stage_vars.keys())
+            if not messagebox.askyesno('确认', '未选择阶段，将按断点自动运行未完成阶段，是否继续？'):
+                return
+            ckpt = Checkpoint(self.cfg.workdir, config_hash=compute_config_hash(self.cfg))
+            all_stages = ['data', 'cluster', 'baseline', 'bo', 'train', 'distill', 'annual', 'sensitivity', 'export']
+            stages = [s for s in all_stages if (s == 'export' or not ckpt.is_done(s))]
+        if resume_mode:
+            self._log('从断点继续模式启动')
         
         self.stop_signal.reset()
         self.run_btn.config(state='disabled')
