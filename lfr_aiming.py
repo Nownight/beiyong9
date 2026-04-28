@@ -283,7 +283,16 @@ def compute_config_hash(cfg: Config) -> str:
         'receiver_height', 'cpc_inlet_height', 'cpc_half_angle_deg', 'cpc_inlet_width',
         'absorber_radius', 'glass_radius',
         'n_rays_eval', 'n_rays_validate', 'n_phi_bins', 'n_z_bins',
-        'bo_n_initial', 'bo_n_iterations', 'samples_per_cluster', 'n_clusters', 'seed'
+        'n_rays_sensitivity',
+        'bo_n_initial', 'bo_n_iterations', 'samples_per_cluster', 'n_clusters', 'seed',
+        'bo_objective_mode',
+        'dni_low', 'dni_high',
+        'thermal_lambda_par', 'thermal_lambda_top',
+        'par_full_target', 'top_flux_target',
+        'eta_floor_low_dni', 'eta_floor_mid_dni', 'eta_floor_high_dni',
+        'annual_eta_floor_rel',
+        'mcrt_deterministic',
+        'fixed_scan_only',
     ]
     payload = {k: getattr(cfg, k) for k in keys}
     txt = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
@@ -377,6 +386,22 @@ def stable_trace_seed(cfg, sun_alt_deg, sun_az_deg, dni, aim_vec, n_rays):
     }
     txt = json.dumps(payload, sort_keys=True)
     return int(hashlib.sha256(txt.encode('utf-8')).hexdigest()[:8], 16)
+
+
+def clip_decision_vars_for_mode(x, cfg):
+    """将决策变量裁剪到当前模式搜索边界，保证保存值与仿真值一致。"""
+    x = np.asarray(x, dtype=float).ravel()
+    if cfg.aim_mode == 'transverse_span' and cfg.experiment_mode == 'grouped_span':
+        bounds = np.asarray(cfg.grouped_span_bounds, dtype=float)
+        if x.size != 3:
+            raise ValueError(f"grouped_span 需要 3 维输入，当前 len={x.size}")
+        return np.clip(x, bounds[:, 0], bounds[:, 1])
+    if cfg.aim_mode == 'transverse_span':
+        lo, hi = cfg.xaim_span_range
+        if x.size != 1:
+            raise ValueError(f"span_1d 需要 1 维输入，当前 len={x.size}")
+        return np.clip(x, lo, hi)
+    return x
 
 
 # ==================== 断点管理 ====================
@@ -1737,6 +1762,7 @@ def stage_bo(cfg: Config, df: pd.DataFrame, cluster_data: dict,
             uniformity_key = cfg.bo_uniformity_metric
 
             def eval_fn(x, _hr=hour_row):
+                x = clip_decision_vars_for_mode(x, cfg)
                 if cfg.aim_mode == 'transverse_span':
                     if cfg.experiment_mode == 'grouped_span':
                         spans = np.asarray(x).ravel()
@@ -1760,7 +1786,12 @@ def stage_bo(cfg: Config, df: pd.DataFrame, cluster_data: dict,
             # 初始点
             if cfg.aim_mode == 'transverse_span' and cfg.experiment_mode == 'grouped_span':
                 x_s1 = np.array([0.0, 0.0, 0.0])
-                initial_points = [[0.0, 0.0, 0.0], [0.035, 0.035, 0.035], [0.015, 0.025, 0.035], [0.005, 0.025, 0.045]]
+                initial_points = [
+                    clip_decision_vars_for_mode([0.0, 0.0, 0.0], cfg).tolist(),
+                    clip_decision_vars_for_mode([0.035, 0.035, 0.035], cfg).tolist(),
+                    clip_decision_vars_for_mode([0.015, 0.025, 0.035], cfg).tolist(),
+                    clip_decision_vars_for_mode([0.005, 0.025, 0.045], cfg).tolist(),
+                ]
             elif cfg.aim_mode == 'transverse_span':
                 x_s1 = np.array([0.0])
                 initial_points = []
@@ -1782,6 +1813,7 @@ def stage_bo(cfg: Config, df: pd.DataFrame, cluster_data: dict,
             selected_x, selected_y, selected_reason, s1_y = select_bo_label_with_eta_floor(
                 X, Y, pmask, x_s1, eta_floor_rel=eta_floor_rel_eff
             )
+            selected_x = clip_decision_vars_for_mode(selected_x, cfg)
 
             # 获取完整 metrics（对 selected_x 再调用一次 trace）
             if cfg.aim_mode == 'transverse_span' and cfg.experiment_mode == 'grouped_span':
@@ -3033,12 +3065,16 @@ def export_figures_and_tables(cfg: Config, df: pd.DataFrame, cluster_data: dict,
     # === 表 3: BO 选择诊断 ===
     samples_diag = bo_data['samples']
     diag_cols = [
-        'cluster', 'sample_idx', 'timestamp', 'eta_opt', 'cv_circ',
-        'sigma_surface', 'par_full', 'top_flux_ratio',
-        'span_optimal', 'xaim_min', 'xaim_max', 'aim_mode',
+        'cluster', 'sample_idx', 'timestamp',
+        'solar_alt', 'solar_az', 'cos_inc', 'dni',
+        'eta_opt', 'cv_circ', 'sigma_surface', 'par_full', 'top_flux_ratio',
+        'span_optimal', 'span_vector', 'span_inner', 'span_mid', 'span_outer',
+        'xaim_min', 'xaim_max', 'aim_mode', 'strategy_param_mode',
         'uniformity_metric', 'uniformity_obj',
         's1_eta_opt', 's1_sigma_surface', 's1_cv_circ',
-        'bo_selected_reason', 'eta_floor_rel'
+        'bo_selected_reason',
+        'eta_floor_rel', 'eta_floor_rel_effective',
+        'dni_risk_weight', 'bo_objective_mode',
     ]
     keep_cols = [c for c in diag_cols if c in samples_diag.columns]
     if keep_cols:
@@ -3047,6 +3083,7 @@ def export_figures_and_tables(cfg: Config, df: pd.DataFrame, cluster_data: dict,
     # === 图 5: Pareto 前沿 ===
     pareto_data = bo_data['pareto_data']
     _sigma_col = 'sigma_surface' if 'sigma_surface' in (bo_data['samples'].columns if hasattr(bo_data['samples'], 'columns') else []) else 'cv_circ'
+    _dni_weighted = (cfg.bo_objective_mode == 'dni_weighted_thermal')
     def draw_fig05(lang):
         fig, axes = plt.subplots(2, 3, figsize=(15, 9))
         for i, c in enumerate(list(pareto_data.keys())[:6]):
@@ -3056,11 +3093,20 @@ def export_figures_and_tables(cfg: Config, df: pd.DataFrame, cluster_data: dict,
                 mask = run['pareto_mask']
                 ax.scatter(Y[:, 1], Y[:, 0], s=10, alpha=0.3, c='gray')
                 ax.scatter(Y[mask, 1], Y[mask, 0], s=30, c='red', label='Pareto')
-            b1 = base_df[(base_df['cluster'] == c) & (base_df['strategy'] == 'S1_center')]
-            if len(b1) and _sigma_col in b1.columns:
-                ax.scatter(b1[_sigma_col], b1['eta_opt'], marker='*', s=200, c='blue', label='S1')
-            xlabel_zh = '表面能流标准差 σ（越小越好）' if _sigma_col == 'sigma_surface' else 'CV_circ（越小越好）'
-            xlabel_en = 'Surface flux std. σ (lower better)' if _sigma_col == 'sigma_surface' else 'CV_circ (lower better)'
+            # 仅在 sigma_surface 模式下叠加 S1 基线点（避免单位不一致）
+            if not _dni_weighted:
+                b1 = base_df[(base_df['cluster'] == c) & (base_df['strategy'] == 'S1_center')]
+                if len(b1) and _sigma_col in b1.columns:
+                    ax.scatter(b1[_sigma_col], b1['eta_opt'], marker='*', s=200, c='blue', label='S1')
+            if _dni_weighted:
+                xlabel_zh = 'DNI 加权热斑风险目标 J（越小越好）\nJ = σ + DNI·PAR/顶部暗区惩罚'
+                xlabel_en = 'DNI-weighted thermal objective J (lower better)\nJ = σ + DNI·PAR/top-dark penalties'
+            elif _sigma_col == 'sigma_surface':
+                xlabel_zh = '表面能流标准差 σ（越小越好）'
+                xlabel_en = 'Surface flux std. σ (lower better)'
+            else:
+                xlabel_zh = 'CV_circ（越小越好）'
+                xlabel_en = 'CV_circ (lower better)'
             ax.set_xlabel(xlabel_zh if lang == 'zh' else xlabel_en)
             ax.set_ylabel('η_opt（越大越好）' if lang == 'zh' else 'η_opt (higher better)')
             ax.set_title(f"{'簇' if lang == 'zh' else 'C'}{c}")
@@ -3428,8 +3474,12 @@ def run_pipeline(cfg: Config, logger: Logger, stop: StopSignal,
         stages_to_run = all_stages
 
     if cfg.experiment_mode == 'fixed_scan' and cfg.fixed_scan_only:
-        stages_to_run = [s for s in stages_to_run if s in ('data', 'cluster', 'sensitivity', 'export')]
-        logger.warn("fixed_scan 模式且 fixed_scan_only=True，仅运行 sensitivity/export，不运行 BO/train/annual。")
+        stages_to_run = [s for s in stages_to_run if s in ('data', 'cluster', 'sensitivity')]
+        logger.warn(
+            "fixed_scan_only=True：仅运行 data/cluster/sensitivity；"
+            "不会进入完整 export，避免加载 BO/annual 文件。"
+            "tab08_fixed_span_scan.csv 和 fig13_fixed_span_scan 已由 sensitivity 阶段自动生成。"
+        )
     
     np.random.seed(cfg.seed)
     if HAS_TORCH:
