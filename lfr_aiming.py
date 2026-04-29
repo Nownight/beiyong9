@@ -1959,8 +1959,12 @@ def create_mcrt_tracer(cfg, geo, logger=None):
 
 
 def describe_runtime_backend(cfg, logger):
+    # 先把 'auto' 解析成实际 backend，与 create_mcrt_tracer 逻辑一致
     backend = getattr(cfg, 'mcrt_backend', 'numpy_cpu')
-    nn_dev  = cfg.get_device() if HAS_TORCH else 'N/A'
+    if backend == 'auto':
+        backend = 'torch_gpu' if (HAS_TORCH and torch.cuda.is_available()) else 'numpy_cpu'
+
+    nn_dev = cfg.get_device() if HAS_TORCH else 'N/A'
     logger.info(f"NN device: {nn_dev}")
 
     if backend == 'torch_gpu':
@@ -1970,15 +1974,17 @@ def describe_runtime_backend(cfg, logger):
             logger.info(f"MCRT backend: torch_gpu  GPU={dev_name}  VRAM={vram_gb:.1f}GB")
             logger.info("  → 所有镜面光线合并为单次 GPU 张量核，CPC 追踪在 GPU 上完成。")
         else:
-            logger.warn("MCRT backend: torch_gpu 请求但 CUDA 不可用；将在 create_mcrt_tracer 时回退。")
-    elif backend == 'numpy_cpu':
+            logger.warn("MCRT backend: torch_gpu 请求但 CUDA 不可用；已回退 numpy_cpu。")
+            backend = 'numpy_cpu'
+
+    if backend == 'numpy_cpu':
         workers = getattr(cfg, 'mcrt_num_workers', 1)
         if workers > 1:
             logger.info(f"MCRT backend: numpy_cpu  workers={workers} (n_rays≥50k 时并行)")
         else:
             logger.info("MCRT backend: numpy_cpu  单线程")
-    else:
-        logger.info(f"MCRT backend: {backend}")
+            logger.warn("  → 当前无 CUDA GPU，MCRT 在 CPU 运行。n_rays 已调大，耗时会较长。"
+                        "如需加速请安装 CUDA 版 PyTorch，或在 GUI 将光线数调回 20000。")
 
 
 # ==================== 5. 基线策略 ====================
