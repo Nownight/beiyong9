@@ -196,8 +196,8 @@ class Config:
     samples_per_cluster: int = 20
     
     # MCRT
-    n_rays_eval: int = 20_000      # BO 内每次评估的光线数 (BO 阶段 ~3-4 小时)
-    n_rays_validate: int = 100_000  # 基线评估和最终验证用更多光线
+    n_rays_eval: int = 100_000     # BO 内每次评估的光线数 (GPU: ~30-60 min; CPU: ~3-4 h)
+    n_rays_validate: int = 500_000  # 基线评估和最终验证用更多光线
     n_phi_bins: int = 36
     n_z_bins: int = 50
     max_cpc_bounces: int = 10
@@ -247,7 +247,7 @@ class Config:
     
     # 验证
     full_year_sample: int = 500
-    n_rays_sensitivity: int = 50_000
+    n_rays_sensitivity: int = 200_000
     
     # 计算
     device: str = 'auto'  # auto/cpu/cuda
@@ -4298,7 +4298,7 @@ class LFRGui:
             ('BO 初始点', 'bo_n_initial', 30, int),
             ('BO 迭代数', 'bo_n_iterations', 80, int),
             ('NN epoch', 'nn_epochs', 200, int),
-            ('MCRT 光线数', 'n_rays_eval', 50000, int),
+            ('MCRT 光线数', 'n_rays_eval', 100000, int),
             ('MCRT workers', 'mcrt_num_workers', 1, int),
             ('MCRT backend', 'mcrt_backend', 'auto', str),
             ('NN device', 'device', 'auto', str),
