@@ -24,6 +24,7 @@ import threading
 import time
 import queue
 import traceback
+import concurrent.futures
 import warnings
 from pathlib import Path
 from dataclasses import dataclass, field, asdict
@@ -1021,7 +1022,9 @@ class MCRTTracer:
         # 衰减因子(乘性)
         self.attenuation_per_cpc_bounce = cfg.rho_cpc
         self.base_attenuation = cfg.rho_mirror * cfg.tau_glass * cfg.alpha_abs * cfg.soiling
-    
+
+        self._precompute_cpc_wall_data()
+
     def trace(self, sun_alt_deg, sun_az_deg, aim_z, dni, n_rays=None):
         """主追踪入口
         aim_z / aim_vec:
@@ -1037,170 +1040,160 @@ class MCRTTracer:
         
         # 每面镜分配光线数
         n_per_mirror = n_rays // self.geo.N
-        
+
         flux_map = np.zeros((self.n_phi, self.n_z))
-        total_input_power = 0.0
         total_absorbed = 0.0
-        
+
         cos_inc_global = self._compute_cos_inc(sun_alt_deg, sun_az_deg)
 
         # 提前展开 aim_vec 以便确定性种子计算
         aim_vec = np.asarray(aim_z, dtype=float).ravel()
-        if self.cfg.mcrt_deterministic:
-            rng = np.random.default_rng(stable_trace_seed(self.cfg, sun_alt_deg, sun_az_deg, dni, aim_vec, n_rays))
-        else:
-            rng = np.random.default_rng()
+        base_seed = (stable_trace_seed(self.cfg, sun_alt_deg, sun_az_deg, dni, aim_vec, n_rays)
+                     if self.cfg.mcrt_deterministic else None)
 
         # 计算 IAM (阴影 + 遮挡 + 端部损失) - 全部镜面一次性计算
         iam_array, iam_components = self.geo.compute_iam(sun_alt_deg, sun_az_deg)
-        
+
         # 太阳方向(全局)
         alt = np.deg2rad(sun_alt_deg)
-        az = np.deg2rad(sun_az_deg)
-        # 坐标系: x=横向, y=管轴, z=高度
+        az  = np.deg2rad(sun_az_deg)
         sun_x = -np.cos(alt) * np.sin(az)
         sun_z = -np.sin(alt)
         sun_y = -np.cos(alt) * np.cos(az)
-        sun_vec = np.array([sun_x, sun_y, sun_z])
-        sun_vec = sun_vec / np.linalg.norm(sun_vec)
-        
-        # 太阳张角 (Pillbox 模型, 半角 4.65 mrad = 0.27°)
-        sun_half_angle_mrad = 4.65
-        
-        for i in range(self.geo.N):
-            mx = self.geo.mirror_x[i]
-            mw = self.geo.mirror_w[i]
-            ma2 = self.geo.mirror_a2[i]
-            
-            # 镜面接收功率 (含 IAM: 阴影/遮挡/端部损失)
-            # IAM 已包含纵向和横向损失,但不含 cos_inc_global (LFR 横向投影)
-            mirror_power = dni * cos_inc_global * mw * self.L * iam_array[i]
-            total_input_power += dni * cos_inc_global * mw * self.L  # 输入按理论功率
-            
-            if iam_array[i] < 1e-6:
-                continue  # 整面镜都被遮蔽,跳过
-            
-            # 该镜的法向量
-            if self.cfg.aim_mode == 'transverse_span':
-                # 新版：光斑打在集热管横截面的不同 x 位置
-                x_aim_i = float(aim_vec[i])
-                target_x = x_aim_i - mx
-                target_z = self.geo.H
-            else:
-                # 旧版兼容：瞄准 CPC 入口中心
-                target_x = -mx
-                target_z = self.geo.cpc_y
-            tlen = np.sqrt(target_x**2 + target_z**2)
-            tx_n, tz_n = target_x / tlen, target_z / tlen
-            # 入射的横纵投影
-            sx_proj = sun_x / np.sqrt(sun_x**2 + sun_z**2 + 1e-9) if (sun_x**2 + sun_z**2) > 1e-9 else 0
-            sz_proj = sun_z / np.sqrt(sun_x**2 + sun_z**2 + 1e-9) if (sun_x**2 + sun_z**2) > 1e-9 else -1
-            # 主跟踪法向 (横截面 2D)
-            nx = tx_n - sx_proj
-            nz = tz_n - sz_proj
-            nlen = np.sqrt(nx**2 + nz**2)
-            nx, nz = nx / nlen, nz / nlen
-            
-            # 在镜面采样光线起点
-            ray_x0 = mx + (rng.random(n_per_mirror) - 0.5) * mw
-            ray_y0 = (rng.random(n_per_mirror) - 0.5) * self.L
-            ray_z0 = np.zeros(n_per_mirror)
-            
-            # === 抛物面镜局部法向修正 ===
-            # 抛物面 z_local(x_local) = a2 · x_local² (x_local 相对镜中心)
-            # 局部斜率 dz/dx = 2·a2·x_local
-            # 局部法向(局部坐标系内,垂直于 dz/dx): (-2·a2·x_local, 0, 1) 归一化后转到全局
-            # 镜面绕 y 轴旋转角 = arctan2(nx, nz)
-            x_local = ray_x0 - mx  # 偏离镜中心的横向距离
-            local_slope = 2 * ma2 * x_local  # dz/dx (局部坐标)
-            # 局部法向 (横截面): n_local = (-slope, 0, 1) / sqrt(1 + slope²)
-            ln_norm = np.sqrt(1 + local_slope**2)
-            n_local_x = -local_slope / ln_norm
-            n_local_z = 1.0 / ln_norm
-            # 镜面整体绕 y 轴旋转后,组合得每条光线的实际法向
-            # 旋转矩阵 R(theta) = [[cos, sin], [-sin, cos]] 应用到 (n_local_x, n_local_z)
-            # 镜面跟踪角(主法向方位): 总法向 = R · 局部法向
-            cos_t = nz; sin_t = nx  # 镜面法向方位 = (sin_t, cos_t) 即 (nx, nz)
-            actual_nx = cos_t * n_local_x + sin_t * n_local_z
-            actual_nz = -sin_t * n_local_x + cos_t * n_local_z
-            
-            # 反射光: r = d - 2(d·n)n, 每条光线独立 n
-            d_dot_n_arr = sun_x * actual_nx + sun_z * actual_nz
-            ref_x_arr = sun_x - 2 * d_dot_n_arr * actual_nx
-            ref_z_arr = sun_z - 2 * d_dot_n_arr * actual_nz
-            ref_y_arr = np.full(n_per_mirror, sun_y)
-            
-            # === 误差源(高斯叠加) ===
-            # 1. 镜面坡度误差 (slope error)  - 影响法向,反射光偏 2 倍 sigma
-            # 2. 跟踪误差 (tracking error)   - 影响整面镜方位
-            # 3. 太阳张角 (sunshape)          - 入射光本身锥角分布 (Pillbox 等概率, 半角 4.65 mrad)
-            sigma_normal = np.sqrt(self.cfg.slope_error_mrad**2 + self.cfg.tracking_error_mrad**2) / 1000
-            # 法向误差导致反射偏移 2σ
-            err_x_normal = rng.normal(0, 2 * sigma_normal, n_per_mirror)
-            err_y_normal = rng.normal(0, 2 * sigma_normal, n_per_mirror)
 
-            # 太阳张角 (Pillbox: 在半角内均匀分布)
-            r_sun = sun_half_angle_mrad / 1000 * np.sqrt(rng.random(n_per_mirror))
-            phi_sun = 2 * np.pi * rng.random(n_per_mirror)
-            err_x_sun = r_sun * np.cos(phi_sun)
-            err_y_sun = r_sun * np.sin(phi_sun)
-            
-            ref_x_arr = ref_x_arr + err_x_normal + err_x_sun
-            ref_y_arr = ref_y_arr + err_y_normal + err_y_sun
-            
-            # 重新归一化
-            rlen = np.sqrt(ref_x_arr**2 + ref_y_arr**2 + ref_z_arr**2)
-            ref_x_arr /= rlen; ref_y_arr /= rlen; ref_z_arr /= rlen
-            
-            # 应用瞄准偏移，调整反射光线方向
-            if self.cfg.aim_mode == 'transverse_span':
-                # 新版：不做管长方向偏移，管长方向保持原 ray_y0（轴向偏移为 0）
-                target_y = ray_y0
-                target_plane_z = self.geo.H
-            else:
-                # 旧版兼容：沿管轴方向移动
-                aim_offset_y = float(aim_vec[i])
-                target_y = ray_y0 + aim_offset_y
-                target_plane_z = self.geo.cpc_y
+        # total_input_power: 纯几何量, 不依赖随机光线, 提前算好
+        total_input_power = float(
+            dni * cos_inc_global * self.L * self.geo.mirror_w.sum()
+        )
 
-            t_to_target = (target_plane_z - ray_z0) / np.maximum(ref_z_arr, 1e-6)
-            ref_y_arr = (target_y - ray_y0) / np.maximum(t_to_target, 1e-6)
-            rlen = np.sqrt(ref_x_arr**2 + ref_y_arr**2 + ref_z_arr**2)
-            ref_x_arr /= rlen; ref_y_arr /= rlen; ref_z_arr /= rlen
-            
-            # 光线追踪到 CPC 入口平面 (z=cpc_y)
-            t_cpc = (self.geo.cpc_y - ray_z0) / ref_z_arr
-            valid = (t_cpc > 0) & (ref_z_arr > 0)
-            x_at_cpc = ray_x0 + ref_x_arr * t_cpc
-            y_at_cpc = ray_y0 + ref_y_arr * t_cpc
-            z_at_cpc = np.full_like(x_at_cpc, self.geo.cpc_y)
-            
-            # 检查是否进入 CPC 入口
-            # CPC 入口判定: 用实际几何输出的入口半宽(由公式决定),不是配置值
-            cpc_half = self.geo._cpc_actual_inlet_half_width
-            in_cpc = valid & (np.abs(x_at_cpc) < cpc_half) & (np.abs(y_at_cpc) < self.L / 2)
-            
-            n_in = in_cpc.sum()
-            if n_in == 0:
-                continue
-            
-            # 进入 CPC 的光线,做 CPC 内反射追踪
-            ray_pos = np.column_stack([x_at_cpc[in_cpc], y_at_cpc[in_cpc], z_at_cpc[in_cpc]])
-            ray_dir = np.column_stack([ref_x_arr[in_cpc], ref_y_arr[in_cpc], ref_z_arr[in_cpc]])
-            # 光线权重: mirror_power 已含 DNI·cos_inc·w·L·IAM, 再乘镜面反射率
-            # 每条光线的份额 = mirror_power / n_per_mirror (未除以进入 CPC 的成功率)
-            # 这样 spillage(未进 CPC 的光)自然计入光学损失
-            ray_weight = np.full(n_in, mirror_power / n_per_mirror * self.cfg.rho_mirror)
-            
-            # CPC 内反射 + 命中吸热管
-            phi_hits, z_hits, weights = self._cpc_trace(ray_pos, ray_dir, ray_weight)
-            
-            # 累加到能流图
-            if len(phi_hits) > 0:
-                phi_idx = np.clip(((phi_hits + np.pi) / (2*np.pi) * self.n_phi).astype(int), 0, self.n_phi - 1)
-                z_idx = np.clip(((z_hits + self.L/2) / self.L * self.n_z).astype(int), 0, self.n_z - 1)
-                np.add.at(flux_map, (phi_idx, z_idx), weights)
-                total_absorbed += weights.sum()
+        # ── 并行路径: n_rays >= 50_000 且 mcrt_num_workers > 1 ──────────────
+        use_parallel = (n_rays >= 50_000 and self.cfg.mcrt_num_workers > 1)
+        if use_parallel:
+            n_workers = min(self.cfg.mcrt_num_workers, self.geo.N)
+            # 各镜的 mirror_power 预先计算（避免在线程内重复）
+            mirror_powers = (
+                dni * cos_inc_global * self.geo.mirror_w * self.L * iam_array
+            )
+            def _submit(i):
+                # 每面镜独立 RNG（与串行路径数值不同, 但同样确定性）
+                seed_i = None if base_seed is None else (base_seed + i) & 0xFFFF_FFFF_FFFF_FFFF
+                return self._trace_one_mirror(
+                    i, seed_i, sun_x, sun_y, sun_z, aim_vec,
+                    n_per_mirror, mirror_powers[i]
+                )
+            with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as ex:
+                futs = [ex.submit(_submit, i) for i in range(self.geo.N)
+                        if iam_array[i] >= 1e-6]
+            for fut in futs:
+                pf, ab = fut.result()
+                flux_map += pf
+                total_absorbed += ab
+
+        # ── 串行路径: 保持原有逻辑, 结果与旧版完全一致 ──────────────────────
+        else:
+            if base_seed is not None:
+                rng = np.random.default_rng(base_seed)
+            else:
+                rng = np.random.default_rng()
+
+            sun_half_angle_mrad = 4.65
+
+            for i in range(self.geo.N):
+                mx  = self.geo.mirror_x[i]
+                mw  = self.geo.mirror_w[i]
+                ma2 = self.geo.mirror_a2[i]
+
+                mirror_power = dni * cos_inc_global * mw * self.L * iam_array[i]
+
+                if iam_array[i] < 1e-6:
+                    continue
+
+                if self.cfg.aim_mode == 'transverse_span':
+                    x_aim_i = float(aim_vec[i])
+                    target_x = x_aim_i - mx
+                    target_z = self.geo.H
+                else:
+                    target_x = -mx
+                    target_z = self.geo.cpc_y
+                tlen = np.sqrt(target_x**2 + target_z**2)
+                tx_n, tz_n = target_x / tlen, target_z / tlen
+                sx_proj = sun_x / np.sqrt(sun_x**2 + sun_z**2 + 1e-9) if (sun_x**2 + sun_z**2) > 1e-9 else 0
+                sz_proj = sun_z / np.sqrt(sun_x**2 + sun_z**2 + 1e-9) if (sun_x**2 + sun_z**2) > 1e-9 else -1
+                nx = tx_n - sx_proj
+                nz = tz_n - sz_proj
+                nlen = np.sqrt(nx**2 + nz**2)
+                nx, nz = nx / nlen, nz / nlen
+
+                ray_x0 = mx + (rng.random(n_per_mirror) - 0.5) * mw
+                ray_y0 = (rng.random(n_per_mirror) - 0.5) * self.L
+                ray_z0 = np.zeros(n_per_mirror)
+
+                x_local    = ray_x0 - mx
+                local_slope = 2 * ma2 * x_local
+                ln_norm    = np.sqrt(1 + local_slope**2)
+                n_local_x  = -local_slope / ln_norm
+                n_local_z  = 1.0 / ln_norm
+                cos_t = nz; sin_t = nx
+                actual_nx = cos_t * n_local_x + sin_t * n_local_z
+                actual_nz = -sin_t * n_local_x + cos_t * n_local_z
+
+                d_dot_n_arr = sun_x * actual_nx + sun_z * actual_nz
+                ref_x_arr = sun_x - 2 * d_dot_n_arr * actual_nx
+                ref_z_arr = sun_z - 2 * d_dot_n_arr * actual_nz
+                ref_y_arr = np.full(n_per_mirror, sun_y)
+
+                sigma_normal = np.sqrt(self.cfg.slope_error_mrad**2 + self.cfg.tracking_error_mrad**2) / 1000
+                err_x_normal = rng.normal(0, 2 * sigma_normal, n_per_mirror)
+                err_y_normal = rng.normal(0, 2 * sigma_normal, n_per_mirror)
+
+                r_sun   = sun_half_angle_mrad / 1000 * np.sqrt(rng.random(n_per_mirror))
+                phi_sun = 2 * np.pi * rng.random(n_per_mirror)
+                err_x_sun = r_sun * np.cos(phi_sun)
+                err_y_sun = r_sun * np.sin(phi_sun)
+
+                ref_x_arr = ref_x_arr + err_x_normal + err_x_sun
+                ref_y_arr = ref_y_arr + err_y_normal + err_y_sun
+
+                rlen = np.sqrt(ref_x_arr**2 + ref_y_arr**2 + ref_z_arr**2)
+                ref_x_arr /= rlen; ref_y_arr /= rlen; ref_z_arr /= rlen
+
+                if self.cfg.aim_mode == 'transverse_span':
+                    target_y      = ray_y0
+                    target_plane_z = self.geo.H
+                else:
+                    aim_offset_y  = float(aim_vec[i])
+                    target_y      = ray_y0 + aim_offset_y
+                    target_plane_z = self.geo.cpc_y
+
+                t_to_target = (target_plane_z - ray_z0) / np.maximum(ref_z_arr, 1e-6)
+                ref_y_arr   = (target_y - ray_y0) / np.maximum(t_to_target, 1e-6)
+                rlen = np.sqrt(ref_x_arr**2 + ref_y_arr**2 + ref_z_arr**2)
+                ref_x_arr /= rlen; ref_y_arr /= rlen; ref_z_arr /= rlen
+
+                t_cpc = (self.geo.cpc_y - ray_z0) / ref_z_arr
+                valid = (t_cpc > 0) & (ref_z_arr > 0)
+                x_at_cpc = ray_x0 + ref_x_arr * t_cpc
+                y_at_cpc = ray_y0 + ref_y_arr * t_cpc
+                z_at_cpc = np.full_like(x_at_cpc, self.geo.cpc_y)
+
+                cpc_half = self.geo._cpc_actual_inlet_half_width
+                in_cpc = valid & (np.abs(x_at_cpc) < cpc_half) & (np.abs(y_at_cpc) < self.L / 2)
+
+                n_in = in_cpc.sum()
+                if n_in == 0:
+                    continue
+
+                ray_pos    = np.column_stack([x_at_cpc[in_cpc], y_at_cpc[in_cpc], z_at_cpc[in_cpc]])
+                ray_dir    = np.column_stack([ref_x_arr[in_cpc], ref_y_arr[in_cpc], ref_z_arr[in_cpc]])
+                ray_weight = np.full(n_in, mirror_power / n_per_mirror * self.cfg.rho_mirror)
+
+                phi_hits, z_hits, weights = self._cpc_trace(ray_pos, ray_dir, ray_weight)
+
+                if len(phi_hits) > 0:
+                    phi_idx = np.clip(((phi_hits + np.pi) / (2*np.pi) * self.n_phi).astype(int), 0, self.n_phi - 1)
+                    z_idx   = np.clip(((z_hits + self.L/2) / self.L * self.n_z).astype(int), 0, self.n_z - 1)
+                    np.add.at(flux_map, (phi_idx, z_idx), weights)
+                    total_absorbed += weights.sum()
         
         # 单位换算: 每个 bin 的功率 / bin 面积 = W/m²
         bin_area = (2 * np.pi * self.cfg.absorber_radius / self.n_phi) * (self.L / self.n_z)
@@ -1315,43 +1308,185 @@ class MCRTTracer:
         
         return np.array(phi_hits), np.array(z_hits), np.array(w_hits)
     
-    def _intersect_cpc_walls(self, pos, direction):
-        """求光线与 CPC 壁段(线段集合)的最近正 t 和法向"""
-        n = len(pos)
-        t_min = np.full(n, np.inf)
-        normal_at_hit = np.zeros((n, 3))
-        
+    def _precompute_cpc_wall_data(self):
+        """把所有 CPC 壁段拼成矩阵，供向量化求交使用（在 __init__ 调用一次）。
+        输出：
+          _wall_p1      (S, 2)  每段起点 [x, z]
+          _wall_seg_dir (S, 2)  每段单位方向
+          _wall_seg_len (S,)    每段长度
+          _wall_normals (S, 2)  内法向 [nx, nz]
+        """
+        p1_list, sd_list, sl_list, nv_list = [], [], [], []
         for segs, normals in [(self.geo.cpc_right_segs, self.geo.cpc_right_normals),
                               (self.geo.cpc_left_segs, self.geo.cpc_left_normals)]:
             for s in range(len(segs) - 1):
-                p1 = segs[s]
-                p2 = segs[s + 1]
-                seg_dir = p2 - p1
-                seg_len = np.linalg.norm(seg_dir)
-                if seg_len < 1e-9:
+                sd = segs[s + 1] - segs[s]
+                sl = np.linalg.norm(sd)
+                if sl < 1e-9:
                     continue
-                seg_dir = seg_dir / seg_len
-                # 光线 (xz 平面) 与线段求交
-                # P_ray = pos[xz] + t * dir[xz]
-                # P_seg = p1 + s_param * seg_dir, s in [0, seg_len]
-                px = pos[:, 0]
-                pz = pos[:, 2]
-                dx = direction[:, 0]
-                dz = direction[:, 2]
-                # 线性方程组: dx*t - seg_dir[0]*s = p1[0] - px
-                #             dz*t - seg_dir[1]*s = p1[1] - pz
-                a1 = dx; b1 = -seg_dir[0]; c1 = p1[0] - px
-                a2 = dz; b2 = -seg_dir[1]; c2 = p1[1] - pz
-                det = a1 * b2 - a2 * b1
-                valid = np.abs(det) > 1e-9
-                t = np.where(valid, (c1 * b2 - c2 * b1) / (det + 1e-12), -1)
-                s_param = np.where(valid, (a1 * c2 - a2 * c1) / (det + 1e-12), -1)
-                hit = valid & (t > 1e-5) & (s_param >= 0) & (s_param <= seg_len) & (t < t_min)
-                if hit.any():
-                    t_min[hit] = t[hit]
-                    normal_at_hit[hit, 0] = normals[s, 0]
-                    normal_at_hit[hit, 2] = normals[s, 1]  # 法向只在 xz 平面
-        
+                p1_list.append(segs[s])
+                sd_list.append(sd / sl)
+                sl_list.append(sl)
+                nv_list.append([normals[s, 0], normals[s, 1]])
+        self._wall_p1      = np.array(p1_list,  dtype=np.float64)  # (S, 2)
+        self._wall_seg_dir = np.array(sd_list,  dtype=np.float64)  # (S, 2)
+        self._wall_seg_len = np.array(sl_list,  dtype=np.float64)  # (S,)
+        self._wall_normals = np.array(nv_list,  dtype=np.float64)  # (S, 2)
+
+    def _trace_one_mirror(self, i, seed, sun_x, sun_y, sun_z, aim_vec,
+                          n_per_mirror, mirror_power):
+        """单面镜完整光追（供 ThreadPoolExecutor 调用）。
+        返回 (partial_flux_map, absorbed_power)。
+        每个线程持有独立 RNG，不共享状态，线程安全。
+        """
+        rng = np.random.default_rng(seed)
+        partial_flux = np.zeros((self.n_phi, self.n_z))
+        absorbed = 0.0
+
+        mx  = self.geo.mirror_x[i]
+        mw  = self.geo.mirror_w[i]
+        ma2 = self.geo.mirror_a2[i]
+
+        # 瞄准方向 → 镜面主法向
+        if self.cfg.aim_mode == 'transverse_span':
+            x_aim_i = float(aim_vec[i])
+            target_x = x_aim_i - mx
+            target_z = self.geo.H
+        else:
+            target_x = -mx
+            target_z = self.geo.cpc_y
+        tlen = np.sqrt(target_x**2 + target_z**2)
+        tx_n, tz_n = target_x / tlen, target_z / tlen
+        sx_proj = sun_x / np.sqrt(sun_x**2 + sun_z**2 + 1e-9) if (sun_x**2 + sun_z**2) > 1e-9 else 0
+        sz_proj = sun_z / np.sqrt(sun_x**2 + sun_z**2 + 1e-9) if (sun_x**2 + sun_z**2) > 1e-9 else -1
+        nx = tx_n - sx_proj
+        nz = tz_n - sz_proj
+        nlen = np.sqrt(nx**2 + nz**2)
+        nx, nz = nx / nlen, nz / nlen
+
+        # 光线起点采样
+        ray_x0 = mx + (rng.random(n_per_mirror) - 0.5) * mw
+        ray_y0 = (rng.random(n_per_mirror) - 0.5) * self.L
+        ray_z0 = np.zeros(n_per_mirror)
+
+        # 抛物面镜局部法向修正
+        x_local    = ray_x0 - mx
+        local_slope = 2 * ma2 * x_local
+        ln_norm    = np.sqrt(1 + local_slope**2)
+        n_local_x  = -local_slope / ln_norm
+        n_local_z  = 1.0 / ln_norm
+        cos_t = nz; sin_t = nx
+        actual_nx = cos_t * n_local_x + sin_t * n_local_z
+        actual_nz = -sin_t * n_local_x + cos_t * n_local_z
+
+        # 反射方向
+        d_dot_n_arr = sun_x * actual_nx + sun_z * actual_nz
+        ref_x_arr = sun_x - 2 * d_dot_n_arr * actual_nx
+        ref_z_arr = sun_z - 2 * d_dot_n_arr * actual_nz
+        ref_y_arr = np.full(n_per_mirror, sun_y)
+
+        # 误差叠加
+        sun_half_angle_mrad = 4.65
+        sigma_normal = np.sqrt(self.cfg.slope_error_mrad**2 + self.cfg.tracking_error_mrad**2) / 1000
+        err_x_normal = rng.normal(0, 2 * sigma_normal, n_per_mirror)
+        err_y_normal = rng.normal(0, 2 * sigma_normal, n_per_mirror)
+        r_sun   = sun_half_angle_mrad / 1000 * np.sqrt(rng.random(n_per_mirror))
+        phi_sun = 2 * np.pi * rng.random(n_per_mirror)
+        ref_x_arr = ref_x_arr + err_x_normal + r_sun * np.cos(phi_sun)
+        ref_y_arr = ref_y_arr + err_y_normal + r_sun * np.sin(phi_sun)
+
+        rlen = np.sqrt(ref_x_arr**2 + ref_y_arr**2 + ref_z_arr**2)
+        ref_x_arr /= rlen; ref_y_arr /= rlen; ref_z_arr /= rlen
+
+        # 瞄准方向修正
+        if self.cfg.aim_mode == 'transverse_span':
+            target_y       = ray_y0
+            target_plane_z = self.geo.H
+        else:
+            target_y       = ray_y0 + float(aim_vec[i])
+            target_plane_z = self.geo.cpc_y
+
+        t_to_target = (target_plane_z - ray_z0) / np.maximum(ref_z_arr, 1e-6)
+        ref_y_arr   = (target_y - ray_y0) / np.maximum(t_to_target, 1e-6)
+        rlen = np.sqrt(ref_x_arr**2 + ref_y_arr**2 + ref_z_arr**2)
+        ref_x_arr /= rlen; ref_y_arr /= rlen; ref_z_arr /= rlen
+
+        # 传播到 CPC 入口面
+        t_cpc    = (self.geo.cpc_y - ray_z0) / ref_z_arr
+        valid    = (t_cpc > 0) & (ref_z_arr > 0)
+        x_at_cpc = ray_x0 + ref_x_arr * t_cpc
+        y_at_cpc = ray_y0 + ref_y_arr * t_cpc
+        z_at_cpc = np.full_like(x_at_cpc, self.geo.cpc_y)
+
+        cpc_half = self.geo._cpc_actual_inlet_half_width
+        in_cpc   = valid & (np.abs(x_at_cpc) < cpc_half) & (np.abs(y_at_cpc) < self.L / 2)
+        n_in     = in_cpc.sum()
+        if n_in == 0:
+            return partial_flux, absorbed
+
+        ray_pos    = np.column_stack([x_at_cpc[in_cpc], y_at_cpc[in_cpc], z_at_cpc[in_cpc]])
+        ray_dir    = np.column_stack([ref_x_arr[in_cpc], ref_y_arr[in_cpc], ref_z_arr[in_cpc]])
+        ray_weight = np.full(n_in, mirror_power / n_per_mirror * self.cfg.rho_mirror)
+
+        phi_hits, z_hits, weights = self._cpc_trace(ray_pos, ray_dir, ray_weight)
+        if len(phi_hits) > 0:
+            phi_idx = np.clip(((phi_hits + np.pi) / (2*np.pi) * self.n_phi).astype(int), 0, self.n_phi - 1)
+            z_idx   = np.clip(((z_hits + self.L/2) / self.L * self.n_z).astype(int), 0, self.n_z - 1)
+            np.add.at(partial_flux, (phi_idx, z_idx), weights)
+            absorbed = weights.sum()
+
+        return partial_flux, absorbed
+
+    def _intersect_cpc_walls(self, pos, direction):
+        """向量化求光线与全部 CPC 壁段的最近正交点。
+
+        方程组（xz 平面）:
+          dx·t - sdx·s = p1x - px
+          dz·t - sdz·s = p1z - pz
+        Cramer 法则解 t 和 s，shape broadcast 为 (n_rays, n_segments)。
+        """
+        n = len(pos)
+        px = pos[:, 0]        # (n,)
+        pz = pos[:, 2]        # (n,)
+        dx = direction[:, 0]  # (n,)
+        dz = direction[:, 2]  # (n,)
+
+        # 壁段数据，shape (S,)
+        p1x = self._wall_p1[:, 0]
+        p1z = self._wall_p1[:, 1]
+        sdx = self._wall_seg_dir[:, 0]
+        sdz = self._wall_seg_dir[:, 1]
+        seg_len = self._wall_seg_len        # (S,)
+
+        # 广播到 (n, S)
+        # det = dx·(-sdz) - dz·(-sdx) = dz·sdx - dx·sdz
+        det = dz[:, None] * sdx[None, :] - dx[:, None] * sdz[None, :]
+        c1  = p1x[None, :] - px[:, None]   # (n, S)  右端第一行
+        c2  = p1z[None, :] - pz[:, None]   # (n, S)  右端第二行
+
+        valid = np.abs(det) > 1e-9
+        inv_det = np.where(valid, 1.0 / (det + 1e-12), 0.0)
+
+        # t = (c1·(-sdz) - c2·(-sdx)) / det = (c2·sdx - c1·sdz) / det
+        t       = np.where(valid, (c2 * sdx[None, :] - c1 * sdz[None, :]) * inv_det, -1.0)
+        # s = (dx·c2 - dz·c1) / det
+        s_param = np.where(valid, (dx[:, None] * c2 - dz[:, None] * c1) * inv_det, -1.0)
+
+        hit_mask = valid & (t > 1e-5) & (s_param >= 0.0) & (s_param <= seg_len[None, :])
+
+        # 每条光线取 t 最小的命中段
+        t_hit = np.where(hit_mask, t, np.inf)    # (n, S)
+        best_s = np.argmin(t_hit, axis=1)         # (n,)
+        t_min  = t_hit[np.arange(n), best_s]      # (n,)
+
+        # 组装法向
+        normal_at_hit = np.zeros((n, 3), dtype=np.float64)
+        has_hit = np.isfinite(t_min)
+        if has_hit.any():
+            bn = self._wall_normals[best_s[has_hit]]  # (k, 2)
+            normal_at_hit[has_hit, 0] = bn[:, 0]
+            normal_at_hit[has_hit, 2] = bn[:, 1]
+
         return t_min, normal_at_hit
     
     def _compute_metrics(self, flux_map):
@@ -1444,7 +1579,11 @@ def create_mcrt_tracer(cfg, geo, logger=None):
 
 def describe_runtime_backend(cfg, logger):
     logger.info(f"NN device: {cfg.get_device()}")
-    logger.info("MCRT backend: numpy_cpu")
+    workers = getattr(cfg, 'mcrt_num_workers', 1)
+    if workers > 1:
+        logger.info(f"MCRT backend: numpy_cpu, 并行 workers={workers} (n_rays>=50k 时启用)")
+    else:
+        logger.info("MCRT backend: numpy_cpu, 单线程")
     logger.warn("当前 MCRT 光追为 NumPy CPU 实现；GPU 只用于 Transformer，不加速 MCRT。")
 
 
