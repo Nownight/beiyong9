@@ -201,7 +201,7 @@ class Config:
     n_phi_bins: int = 36
     n_z_bins: int = 50
     max_cpc_bounces: int = 10
-    mcrt_backend: str = 'numpy_cpu'
+    mcrt_backend: str = 'auto'   # 'auto'|'numpy_cpu'|'torch_gpu'
     mcrt_num_workers: int = 1
     mcrt_deterministic: bool = True
 
@@ -1569,22 +1569,416 @@ class MCRTTracer:
                 'q_mean_full': float(q_mean_full)}
 
 
+class MCRTTracerGPU(MCRTTracer):
+    """PyTorch GPU-accelerated MCRT tracer.
+
+    Batches ALL mirrors' rays into a single tensor kernel per call, replacing
+    the per-mirror Python loop.  Falls back gracefully to the CPU parent class
+    if CUDA is unavailable at construction time.
+
+    Numerical differences vs. numpy_cpu are expected (float32, different RNG
+    sequence) but statistically equivalent.
+
+    Backend tag: 'torch_gpu'
+    """
+
+    def __init__(self, cfg: Config, geo: LFRGeometry, device: str = 'cuda'):
+        super().__init__(cfg, geo)          # reuse CPC wall precomputation (_wall_p1, etc.)
+        self.torch_device = torch.device(device)
+        self._upload_wall_tensors()
+
+    def _upload_wall_tensors(self):
+        dev = self.torch_device
+        dt = torch.float32
+        self._t_wall_p1 = torch.tensor(self._wall_p1,      dtype=dt, device=dev)
+        self._t_wall_sd = torch.tensor(self._wall_seg_dir, dtype=dt, device=dev)
+        self._t_wall_sl = torch.tensor(self._wall_seg_len, dtype=dt, device=dev)
+        self._t_wall_n  = torch.tensor(self._wall_normals, dtype=dt, device=dev)
+
+    # ------------------------------------------------------------------
+    # Public API (same signature as MCRTTracer.trace)
+    # ------------------------------------------------------------------
+
+    def trace(self, sun_alt_deg, sun_az_deg, aim_z, dni, n_rays=None):
+        if n_rays is None:
+            n_rays = self.cfg.n_rays_eval
+
+        N = self.geo.N
+        n_per_mirror = max(1, n_rays // N)
+        dev = self.torch_device
+        dt  = torch.float32
+
+        aim_vec = np.asarray(aim_z, dtype=float).ravel()
+        base_seed = (stable_trace_seed(self.cfg, sun_alt_deg, sun_az_deg, dni, aim_vec, n_rays)
+                     if self.cfg.mcrt_deterministic else None)
+
+        gen = torch.Generator(device=dev)
+        if base_seed is not None:
+            gen.manual_seed(int(base_seed & 0x7FFF_FFFF_FFFF_FFFF))
+
+        # ── Geometry scalars ──────────────────────────────────────────
+        cos_inc_global = self._compute_cos_inc(sun_alt_deg, sun_az_deg)
+        iam_array, _   = self.geo.compute_iam(sun_alt_deg, sun_az_deg)
+
+        alt   = np.deg2rad(sun_alt_deg)
+        az    = np.deg2rad(sun_az_deg)
+        sun_x = float(-np.cos(alt) * np.sin(az))
+        sun_z = float(-np.sin(alt))
+        sun_y = float(-np.cos(alt) * np.cos(az))
+
+        total_input_power = float(dni * cos_inc_global * self.L * self.geo.mirror_w.sum())
+
+        # ── Mirror geometry tensors (N,) ──────────────────────────────
+        mirror_x  = torch.tensor(self.geo.mirror_x,  dtype=dt, device=dev)
+        mirror_w  = torch.tensor(self.geo.mirror_w,  dtype=dt, device=dev)
+        mirror_a2 = torch.tensor(self.geo.mirror_a2, dtype=dt, device=dev)
+        iam_t     = torch.tensor(iam_array,           dtype=dt, device=dev)
+        aim_vec_t = torch.tensor(aim_vec,             dtype=dt, device=dev)
+
+        mirror_powers = (iam_t * torch.tensor(
+            dni * cos_inc_global * self.geo.mirror_w * self.L, dtype=dt, device=dev))
+
+        active = iam_t >= 1e-6   # (N,) bool mask
+
+        # ── Ray origin sampling: (N, n_per_mirror) ───────────────────
+        rx = torch.rand(N, n_per_mirror, generator=gen, device=dev, dtype=dt)
+        ry = torch.rand(N, n_per_mirror, generator=gen, device=dev, dtype=dt)
+
+        ray_x0 = mirror_x[:, None] + (rx - 0.5) * mirror_w[:, None]
+        ray_y0 = (ry - 0.5) * self.L
+        ray_z0 = torch.zeros(N, n_per_mirror, dtype=dt, device=dev)
+
+        # ── Mirror normal from aiming direction ───────────────────────
+        if self.cfg.aim_mode == 'transverse_span':
+            target_x_mir = aim_vec_t - mirror_x                        # (N,)
+            target_z_mir = torch.full((N,), float(self.geo.H), dtype=dt, device=dev)
+        else:
+            target_x_mir = -mirror_x
+            target_z_mir = torch.full((N,), float(self.geo.cpc_y), dtype=dt, device=dev)
+
+        tlen   = torch.sqrt(target_x_mir**2 + target_z_mir**2).clamp(min=1e-9)
+        tx_n   = target_x_mir / tlen
+        tz_n   = target_z_mir / tlen
+
+        sun_xz_norm = float(np.sqrt(sun_x**2 + sun_z**2))
+        if sun_xz_norm > 1e-9:
+            sx_proj, sz_proj = float(sun_x / sun_xz_norm), float(sun_z / sun_xz_norm)
+        else:
+            sx_proj, sz_proj = 0.0, -1.0
+
+        nx_mir = (tx_n - sx_proj)
+        nz_mir = (tz_n - sz_proj)
+        n_mir_len = torch.sqrt(nx_mir**2 + nz_mir**2).clamp(min=1e-9)
+        nx_mir = nx_mir / n_mir_len
+        nz_mir = nz_mir / n_mir_len
+
+        # ── Parabolic mirror local normal + tilt correction ───────────
+        x_local    = ray_x0 - mirror_x[:, None]        # (N, npm)
+        local_slope = 2.0 * mirror_a2[:, None] * x_local
+        ln_norm    = torch.sqrt(1.0 + local_slope**2)
+        n_local_x  = -local_slope / ln_norm
+        n_local_z  = 1.0 / ln_norm
+
+        cos_t = nz_mir[:, None]
+        sin_t = nx_mir[:, None]
+        actual_nx = cos_t * n_local_x + sin_t * n_local_z
+        actual_nz = -sin_t * n_local_x + cos_t * n_local_z
+
+        # ── Specular reflection direction ─────────────────────────────
+        d_dot_n = sun_x * actual_nx + sun_z * actual_nz
+        ref_x = sun_x - 2.0 * d_dot_n * actual_nx
+        ref_z = sun_z - 2.0 * d_dot_n * actual_nz
+        ref_y = torch.full((N, n_per_mirror), sun_y, dtype=dt, device=dev)
+
+        # ── Slope + tracking error + solar disc ───────────────────────
+        sun_half_angle_mrad = 4.65
+        sigma_normal = float(np.sqrt(self.cfg.slope_error_mrad**2 +
+                                     self.cfg.tracking_error_mrad**2) / 1000.0)
+        err_xn  = torch.randn(N, n_per_mirror, generator=gen, device=dev, dtype=dt) * (2.0 * sigma_normal)
+        err_yn  = torch.randn(N, n_per_mirror, generator=gen, device=dev, dtype=dt) * (2.0 * sigma_normal)
+        r_sq    = torch.rand(N, n_per_mirror, generator=gen, device=dev, dtype=dt)
+        phi_sun = torch.rand(N, n_per_mirror, generator=gen, device=dev, dtype=dt) * float(2.0 * np.pi)
+        r_sun   = (sun_half_angle_mrad / 1000.0) * torch.sqrt(r_sq)
+
+        ref_x = ref_x + err_xn + r_sun * torch.cos(phi_sun)
+        ref_y = ref_y + err_yn + r_sun * torch.sin(phi_sun)
+
+        rlen  = torch.sqrt(ref_x**2 + ref_y**2 + ref_z**2).clamp(min=1e-9)
+        ref_x = ref_x / rlen
+        ref_y = ref_y / rlen
+        ref_z = ref_z / rlen
+
+        # ── Longitudinal aiming correction (redirect ref_y) ───────────
+        if self.cfg.aim_mode == 'transverse_span':
+            target_y      = ray_y0                                     # delta_y = 0
+            target_plane_z = float(self.geo.H)
+        else:
+            target_y      = ray_y0 + aim_vec_t[:, None]               # (N, npm)
+            target_plane_z = float(self.geo.cpc_y)
+
+        t_to_target = (target_plane_z - ray_z0) / ref_z.clamp(min=1e-6)
+        ref_y       = (target_y - ray_y0) / t_to_target.clamp(min=1e-6)
+
+        rlen  = torch.sqrt(ref_x**2 + ref_y**2 + ref_z**2).clamp(min=1e-9)
+        ref_x = ref_x / rlen
+        ref_y = ref_y / rlen
+        ref_z = ref_z / rlen
+
+        # ── Propagate to CPC inlet plane ──────────────────────────────
+        cpc_y = float(self.geo.cpc_y)
+        t_cpc    = cpc_y / ref_z.clamp(min=1e-9)             # ray_z0 = 0
+        valid    = (t_cpc > 0) & (ref_z > 0)
+        x_at_cpc = ray_x0 + ref_x * t_cpc
+        y_at_cpc = ray_y0 + ref_y * t_cpc
+
+        cpc_half = float(self.geo._cpc_actual_inlet_half_width)
+        in_cpc = (valid
+                  & (torch.abs(x_at_cpc) < cpc_half)
+                  & (torch.abs(y_at_cpc) < self.L / 2.0)
+                  & active[:, None])
+
+        # ── Gather CPC-entering rays (flatten N×npm → K) ──────────────
+        flat_mask = in_cpc.reshape(-1)
+        K = int(flat_mask.sum().item())
+
+        if K == 0:
+            empty = np.zeros((self.n_phi, self.n_z))
+            metrics = self._compute_metrics(empty)
+            metrics.update({'eta_opt': 0.0, 'total_absorbed_W': 0.0,
+                            'total_input_W': total_input_power})
+            return empty, metrics
+
+        ray_w_base = (mirror_powers * float(self.cfg.rho_mirror) / n_per_mirror).unsqueeze(1).expand(N, n_per_mirror)
+
+        pos_x  = x_at_cpc.reshape(-1)[flat_mask]
+        pos_y  = y_at_cpc.reshape(-1)[flat_mask]
+        pos_z  = torch.full((K,), cpc_y, dtype=dt, device=dev)
+        dir_x  = ref_x.reshape(-1)[flat_mask]
+        dir_y  = ref_y.reshape(-1)[flat_mask]
+        dir_z  = ref_z.reshape(-1)[flat_mask]
+        weights = ray_w_base.reshape(-1)[flat_mask]
+
+        pos_t = torch.stack([pos_x, pos_y, pos_z], dim=1)   # (K, 3)
+        dir_t = torch.stack([dir_x, dir_y, dir_z], dim=1)   # (K, 3)
+
+        # ── CPC trace on GPU ──────────────────────────────────────────
+        flux_map_t, total_absorbed = self._cpc_trace_gpu(pos_t, dir_t, weights)
+
+        bin_area = (2.0 * np.pi * self.cfg.absorber_radius / self.n_phi) * (self.L / self.n_z)
+        flux_map_np = flux_map_t.cpu().numpy() / bin_area
+
+        eta_opt = float(total_absorbed) / max(total_input_power, 1e-9)
+        metrics = self._compute_metrics(flux_map_np)
+        metrics['eta_opt']          = eta_opt
+        metrics['total_absorbed_W'] = float(total_absorbed)
+        metrics['total_input_W']    = total_input_power
+        return flux_map_np, metrics
+
+    # ------------------------------------------------------------------
+    # GPU CPC bounce tracer
+    # ------------------------------------------------------------------
+
+    def _cpc_trace_gpu(self, pos, direction, weight):
+        """Multi-bounce CPC trace entirely on GPU.
+
+        pos/direction: (K, 3) float32 tensors already on self.torch_device.
+        weight: (K,) float32.
+        Returns: (flux_map tensor [n_phi, n_z], total_absorbed float).
+        """
+        dev = self.torch_device
+        dt  = torch.float32
+
+        absorber_z = float(self.geo.H)
+        r_abs      = float(self.cfg.absorber_radius)
+        half_L     = self.L / 2.0
+
+        flux_flat      = torch.zeros(self.n_phi * self.n_z, dtype=dt, device=dev)
+        total_absorbed = 0.0
+
+        # live[j] == True  →  ray j is still propagating
+        live = torch.ones(len(pos), dtype=torch.bool, device=dev)
+
+        for _bounce in range(self.cfg.max_cpc_bounces + 1):
+            n_live = int(live.sum().item())
+            if n_live == 0:
+                break
+
+            idx_live = torch.where(live)[0]            # (M,)
+            p = pos[idx_live]                          # (M, 3)
+            d = direction[idx_live]                    # (M, 3)
+            w = weight[idx_live]                       # (M,)
+
+            # ── Absorber cylinder intersection (xz-plane) ──────────
+            dx = d[:, 0]; dz = d[:, 2]
+            px = p[:, 0]; pz = p[:, 2] - absorber_z
+            a   = dx**2 + dz**2
+            b   = 2.0 * (px * dx + pz * dz)
+            c   = px**2 + pz**2 - r_abs**2
+            disc = b**2 - 4.0 * a * c
+
+            sqrt_disc = torch.sqrt(disc.clamp(min=0.0))
+            inv2a = 1.0 / (2.0 * a + 1e-12)
+            t1 = (-b - sqrt_disc) * inv2a
+            t2 = (-b + sqrt_disc) * inv2a
+            inf_t = torch.full_like(t1, float('inf'))
+            t1 = torch.where((disc >= 0) & (t1 > 1e-6), t1, inf_t)
+            t2 = torch.where((disc >= 0) & (t2 > 1e-6), t2, inf_t)
+            t_abs = torch.minimum(t1, t2)
+
+            # ── CPC wall intersection ──────────────────────────────
+            t_wall, wall_normal = self._intersect_cpc_walls_gpu(p, d)
+
+            # ── Classify fate ──────────────────────────────────────
+            hit_abs  = torch.isfinite(t_abs)  & (t_abs  < t_wall)
+            hit_wall = torch.isfinite(t_wall) & (t_wall < t_abs)
+
+            # ── Absorber hits → accumulate flux ────────────────────
+            if hit_abs.any():
+                ha = torch.where(hit_abs)[0]
+                hp = p[ha] + d[ha] * t_abs[ha, None]
+                rel_x = hp[:, 0]
+                rel_z = hp[:, 2] - absorber_z
+                phi   = torch.atan2(rel_z, rel_x)          # [-π, π]
+                y_pos = hp[:, 1]
+
+                phi_idx = ((phi + np.pi) / (2.0 * np.pi) * self.n_phi).long().clamp(0, self.n_phi - 1)
+                z_idx   = ((y_pos + half_L) / self.L * self.n_z).long().clamp(0, self.n_z - 1)
+                lin_idx = phi_idx * self.n_z + z_idx
+
+                hw = w[ha]
+                flux_flat.scatter_add_(0, lin_idx, hw)
+                total_absorbed += float(hw.sum().item())
+
+                live[idx_live[ha]] = False
+
+            # ── Wall hits → specular reflection ────────────────────
+            if hit_wall.any():
+                hw_idx = torch.where(hit_wall)[0]
+                new_p  = p[hw_idx] + d[hw_idx] * t_wall[hw_idx, None]
+                nd     = d[hw_idx]
+                nv     = wall_normal[hw_idx]
+                d_dot_n = (nd * nv).sum(dim=1, keepdim=True)
+                new_d  = nd - 2.0 * d_dot_n * nv
+                new_p  = new_p + new_d * 1e-5             # push off wall
+
+                g = idx_live[hw_idx]
+                pos[g]       = new_p
+                direction[g] = new_d
+                weight[g]   *= self.attenuation_per_cpc_bounce
+
+            # ── Escaped rays → dead ────────────────────────────────
+            escaped = ~hit_abs & ~hit_wall
+            if escaped.any():
+                live[idx_live[torch.where(escaped)[0]]] = False
+
+        return flux_flat.view(self.n_phi, self.n_z), total_absorbed
+
+    # ------------------------------------------------------------------
+    # GPU CPC wall intersection (mirrors _intersect_cpc_walls for tensors)
+    # ------------------------------------------------------------------
+
+    def _intersect_cpc_walls_gpu(self, pos, direction):
+        """Vectorized (n_rays × n_segments) intersection on GPU.
+
+        Returns (t_min (M,), normal_at_hit (M, 3)) as float32 tensors.
+        """
+        dev = self.torch_device
+        dt  = torch.float32
+        n   = len(pos)
+
+        px = pos[:, 0]; pz = pos[:, 2]
+        dx = direction[:, 0]; dz = direction[:, 2]
+
+        p1x = self._t_wall_p1[:, 0]; p1z = self._t_wall_p1[:, 1]
+        sdx = self._t_wall_sd[:, 0]; sdz = self._t_wall_sd[:, 1]
+        seg_len = self._t_wall_sl     # (S,)
+
+        # Broadcast to (n, S)
+        det = dz[:, None] * sdx[None, :] - dx[:, None] * sdz[None, :]
+        c1  = p1x[None, :] - px[:, None]
+        c2  = p1z[None, :] - pz[:, None]
+
+        valid   = torch.abs(det) > 1e-9
+        inv_det = torch.where(valid, 1.0 / (det + 1e-12), torch.zeros_like(det))
+
+        t       = torch.where(valid, (c2 * sdx[None, :] - c1 * sdz[None, :]) * inv_det, torch.full_like(det, -1.0))
+        s_param = torch.where(valid, (dx[:, None] * c2 - dz[:, None] * c1) * inv_det, torch.full_like(det, -1.0))
+
+        hit_mask = valid & (t > 1e-5) & (s_param >= 0.0) & (s_param <= seg_len[None, :])
+        t_hit    = torch.where(hit_mask, t, torch.full_like(t, float('inf')))
+
+        best_s = torch.argmin(t_hit, dim=1)                       # (n,)
+        t_min  = t_hit[torch.arange(n, device=dev), best_s]       # (n,)
+
+        normal_at_hit = torch.zeros(n, 3, dtype=dt, device=dev)
+        has_hit = torch.isfinite(t_min)
+        if has_hit.any():
+            bn = self._t_wall_n[best_s[has_hit]]                  # (k, 2)
+            normal_at_hit[has_hit, 0] = bn[:, 0]
+            normal_at_hit[has_hit, 2] = bn[:, 1]
+
+        return t_min, normal_at_hit
+
+
 def create_mcrt_tracer(cfg, geo, logger=None):
-    if getattr(cfg, 'mcrt_backend', 'numpy_cpu') != 'numpy_cpu':
+    """Build an MCRT tracer according to cfg.mcrt_backend.
+
+    Supported backends:
+      'numpy_cpu'  – pure NumPy, CPU-only (default)
+      'torch_gpu'  – PyTorch CUDA batched tracer (requires torch + CUDA)
+      'auto'       – use torch_gpu when CUDA is available, else numpy_cpu
+    """
+    backend = getattr(cfg, 'mcrt_backend', 'numpy_cpu')
+
+    # Resolve 'auto'
+    if backend == 'auto':
+        backend = 'torch_gpu' if (HAS_TORCH and torch.cuda.is_available()) else 'numpy_cpu'
+        cfg.mcrt_backend = backend
+
+    if backend == 'torch_gpu':
+        if not HAS_TORCH:
+            if logger:
+                logger.warn("torch_gpu 需要 PyTorch 但未安装；回退 numpy_cpu。")
+            cfg.mcrt_backend = 'numpy_cpu'
+            return MCRTTracer(cfg, geo)
+        if not torch.cuda.is_available():
+            if logger:
+                logger.warn("torch_gpu 请求但 CUDA 不可用；回退 numpy_cpu。")
+            cfg.mcrt_backend = 'numpy_cpu'
+            return MCRTTracer(cfg, geo)
         if logger:
-            logger.warn("当前生产版仅支持 MCRT numpy_cpu；已回退 numpy_cpu。")
+            dev_name = torch.cuda.get_device_name(0)
+            logger.info(f"MCRT backend: torch_gpu  GPU={dev_name}")
+        return MCRTTracerGPU(cfg, geo, device='cuda')
+
+    if backend != 'numpy_cpu':
+        if logger:
+            logger.warn(f"未知 MCRT backend '{backend}'；回退 numpy_cpu。")
         cfg.mcrt_backend = 'numpy_cpu'
     return MCRTTracer(cfg, geo)
 
 
 def describe_runtime_backend(cfg, logger):
-    logger.info(f"NN device: {cfg.get_device()}")
-    workers = getattr(cfg, 'mcrt_num_workers', 1)
-    if workers > 1:
-        logger.info(f"MCRT backend: numpy_cpu, 并行 workers={workers} (n_rays>=50k 时启用)")
+    backend = getattr(cfg, 'mcrt_backend', 'numpy_cpu')
+    nn_dev  = cfg.get_device() if HAS_TORCH else 'N/A'
+    logger.info(f"NN device: {nn_dev}")
+
+    if backend == 'torch_gpu':
+        if HAS_TORCH and torch.cuda.is_available():
+            dev_name = torch.cuda.get_device_name(0)
+            vram_gb  = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            logger.info(f"MCRT backend: torch_gpu  GPU={dev_name}  VRAM={vram_gb:.1f}GB")
+            logger.info("  → 所有镜面光线合并为单次 GPU 张量核，CPC 追踪在 GPU 上完成。")
+        else:
+            logger.warn("MCRT backend: torch_gpu 请求但 CUDA 不可用；将在 create_mcrt_tracer 时回退。")
+    elif backend == 'numpy_cpu':
+        workers = getattr(cfg, 'mcrt_num_workers', 1)
+        if workers > 1:
+            logger.info(f"MCRT backend: numpy_cpu  workers={workers} (n_rays≥50k 时并行)")
+        else:
+            logger.info("MCRT backend: numpy_cpu  单线程")
     else:
-        logger.info("MCRT backend: numpy_cpu, 单线程")
-    logger.warn("当前 MCRT 光追为 NumPy CPU 实现；GPU 只用于 Transformer，不加速 MCRT。")
+        logger.info(f"MCRT backend: {backend}")
 
 
 # ==================== 5. 基线策略 ====================
@@ -3777,7 +4171,7 @@ def run_pipeline(cfg: Config, logger: Logger, stop: StopSignal,
         logger.info("=== 最终论文主实验建议 ===")
         logger.info("  experiment_mode='grouped_span'")
         logger.info("  bo_objective_mode='dni_weighted_thermal'")
-        logger.info("  mcrt_backend='numpy_cpu'")
+        logger.info("  mcrt_backend='auto'  (auto-selects torch_gpu if CUDA available, else numpy_cpu)")
         logger.info("  enable_pysr=False")
         logger.info("  mcrt_deterministic=True")
         logger.info("主对比: S1_center / Paper_fixed_span_0.035 / BO_grouped_span / NN_grouped_span")
@@ -3906,6 +4300,7 @@ class LFRGui:
             ('NN epoch', 'nn_epochs', 200, int),
             ('MCRT 光线数', 'n_rays_eval', 50000, int),
             ('MCRT workers', 'mcrt_num_workers', 1, int),
+            ('MCRT backend', 'mcrt_backend', 'auto', str),
             ('NN device', 'device', 'auto', str),
             ('PySR 启用', 'enable_pysr', False, bool),
             ('Experiment mode', 'experiment_mode', 'grouped_span', str),
